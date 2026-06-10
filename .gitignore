@@ -1,0 +1,5 @@
+build/
+os.iso
+iso/boot/frostbyte.elf
+*.o
+*.elf
