@@ -19,6 +19,7 @@ SECTIONS
     {
         *(.multiboot)
         *(.boot.text)
+        *(.boot.data)
         . = ALIGN(4096);
         *(.boot.pagetables)
     } :boot
@@ -33,6 +34,10 @@ SECTIONS
     .rodata ALIGN(4096) : AT(ADDR(.rodata) - KERNEL_VMA)
     {
         *(.rodata .rodata.*)
+        . = ALIGN(8);
+        ktestArrayStart = .;
+        KEEP(*(.ktests .ktests.*))
+        ktestArrayEnd = .;
     } :rodata
 
     .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_VMA)

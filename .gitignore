@@ -3,3 +3,4 @@ os.iso
 iso/boot/frostbyte.elf
 *.o
 *.elf
+iso/boot/initrd.img
