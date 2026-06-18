@@ -178,4 +178,99 @@ bool shellExtractRedirects(char** argv, int* argc, ShellRedirect* out);
    with '$' at all -- callers treat "false" as "not a variable reference,
    leave this token exactly as typed". */
 bool shellParseVarRef(const char* token, char* nameOut, int nameCap);
+
+/* Recognizes shell.c's `$?` special parameter -- real POSIX shells' own
+   most-recently-completed command status, distinct from any `$NAME`
+   environment variable (shellParseVarRef above deliberately rejects it:
+   '?' is not in its own [A-Za-z0-9_] name-character set, so the two
+   token classes can never collide). `token` must be EXACTLY the two
+   characters "$?" and nothing else -- same "whole token or nothing"
+   contract shellParseVarRef already gives `$NAME`, so `$?x` or `x$?` are
+   both rejected, left for the caller to treat as an ordinary literal
+   token. The glue that resolves a match into an actual decimal status
+   string (shell.c's shellExpandToken, which reads shell.c's own
+   file-scope `lastStatus`) is not pure, so only this syntax check lives
+   here -- the same "pure logic here, thread/state-touching glue stays
+   static in shell.c" split shellParseVarRef already established. */
+bool shellIsStatusVarToken(const char* token);
+
+/* Classic shell wildcard matcher: '*' matches any run of characters
+   (including none), '?' matches exactly one character, anything else must
+   match `name` literally. Pure string logic (no VFS/scheduler involved),
+   iterative rather than recursive (a single backtrack point remembering
+   the most recent '*' and where in `name` it started matching from) --
+   the same shape a real libc fnmatch(3) uses, and the same "pure logic
+   here, thread/VFS-touching glue stays static in shell.c" split
+   shellTokenize/shellSplitPipelineStages/shellExtractRedirects/
+   shellParseVarRef above already established. Exposed here for
+   shellTest.c's KTEST coverage. */
+bool shellGlobMatch(const char* pattern, const char* name);
+
+/* True if `token` contains at least one glob metacharacter ('*' or '?') --
+   the same "is this token special" gate shellParseVarRef gives '$', used by
+   shell.c's shellExpandGlobs to decide whether a token needs real directory
+   listing + matching at all, or can pass through completely untouched (the
+   common case for most argv words, which have no wildcard in them at
+   all). */
+bool shellTokenHasGlob(const char* token);
+
+/* Splits `token` at its LAST '/' into `dirOut` (everything up to and
+   including that '/', or an empty string if `token` has no '/' at all --
+   meaning "the current directory", exactly like a bare `*.txt` in a real
+   shell) and `patternOut` (everything after it, the actual glob pattern to
+   match each directory entry's own name against via shellGlobMatch above).
+   Only this FINAL path component may itself contain glob syntax -- `dirOut`
+   is never re-scanned for `*`/`?` by anything in shell.c, an
+   honestly-scoped limitation (e.g. `/tmp/gd/ *.txt` is supported,
+   `/tmp/ * /file.txt` is not) matching this file's existing pattern of
+   documenting what its syntax does NOT attempt (see runPipelineStages' own
+   "no stage may be a builtin" and shellExtractRedirects' own redirect-target
+   scope limits). Truncates silently (like every other fixed-capacity buffer
+   in this shell) if either half does not fit its own capacity. Exposed here
+   for the same pre-scheduler, no-VFS KTEST coverage every other pure
+   function in this file already gets (shellTest.c). */
+void shellSplitGlobToken(const char* token, char* dirOut, int dirCap, char* patternOut, int patternCap);
+
+/* Recognizes shell.c's `$(cmd [args])` command-substitution syntax --
+   locates the FIRST `$(` anywhere in `line` and its matching `)` (no
+   nesting: the very next `)` after the opening `$(`, an honestly-scoped
+   limitation matching shellSplitGlobToken's own "only the final path
+   component" scope note), and copies the text between them (the command
+   to run, still completely unparsed) into `cmdOut`, truncated to `cmdCap`
+   like every other fixed-capacity buffer in this file.
+   Returns true with `*startOut` set to -1 (cmdOut/`*endOut` left
+   untouched) if `line` contains no `$(` at all -- the caller's signal to
+   stop looking, exactly like shellSplitPipelineStages' own "0 means
+   nothing found" convention but spelled with a sentinel index instead of a
+   sentinel count, since a real match also needs to report WHERE in the
+   line it sits. On a real match, `*startOut`/`*endOut` are the byte
+   offsets of the leading `$` and one-past the matching `)` respectively,
+   so a caller can splice `line[0..*startOut)` + (whatever `cmdOut`
+   evaluates to) + `line[*endOut..]` into a new line the same way
+   shellExtractRedirects' caller already reassembles argv around removed
+   tokens. Returns false, leaving everything untouched, if a `$(` is found
+   with no matching `)` anywhere after it -- the same "malformed input,
+   caller reports an error" shape shellExtractRedirects already uses for an
+   operator with no filename. Exposed here (rather than kept static in
+   shell.c) for the same pre-scheduler, no-VFS KTEST coverage every other
+   pure syntax function in this file already gets (shellTest.c) -- the glue
+   that actually RUNS `cmdOut` and splices its captured output back in
+   (shell.c's shellExpandCommandSubst) is not pure, so only the syntax half
+   lives here, the same split shellParseVarRef/shellIsStatusVarToken above
+   already established for `$NAME`/`$?`. */
+bool shellFindCommandSubst(const char* line, int* startOut, int* endOut, char* cmdOut, int cmdCap);
+
+/* The pid most recently spawned by the shell's own `NAME [ARGS] [&]`
+   fallback (shell.c's runProgram) -- foreground or background alike, set
+   the instant jobctlSpawnForeground/jobctlRunBackground (jobctl.h) hand
+   one back, never only after a foreground job has already exited -- or
+   threadInvalidId if the shell has never run anything yet. Lets a
+   boot-time live demo (kmain.c) that drives the real interactive shell
+   through injected keystrokes (there being no automated way to drive a
+   real PS/2 keyboard under headless QEMU) find out what pid it just asked
+   the shell to run, so it can act on that specific job (e.g. proving a
+   backgrounded one stays alive across an injected Ctrl-C the same way
+   user/pgroupbg.c's boot-time-spawned counterpart already does). */
+uint32 shellLastSpawnedPid(void);
+
 #endif
