@@ -1,0 +1,29 @@
+
+========================================
+  frostbyte kernel  x86_64  long mode
+  multiboot2 / grub / freestanding gcc
+========================================
+
+[boot] multiboot2 magic verified (36d76289)
+[gdt]  loaded flat 64-bit segments
+[idt]  256 vectors installed (32 exceptions, 16 irqs)
+[pic]  remapped to 0x20-0x2f, irq0 and irq1 unmasked
+[pmm]  130559 KiB usable, 32736 frames, 32463 free after kernel
+[heap] bump allocator at 0x0000000000111000, 8192 KiB
+[paging] mapped 0x0000000040000000 -> phys 911000, readback OK
+[pit]  timer at 100 Hz
+[kbd]  ps/2 keyboard driver ready
+[sched] 4 threads: idle, shell, workerA, workerB
+
+[boot] enabling interrupts, starting preemptive scheduler
+[boot] workerA/workerB log from separate stacks to prove round-robin
+
+
+frostbyte shell ready. type 'help'.
+frostbyte> [workerA] tick=50 iterations=8650613
+[workerB] tick=91 iterations=15943273
+[workerA] tick=150 iterations=29911570
+[workerB] tick=191 iterations=34964279
+[workerA] tick=250 iterations=47022830
+[workerB] tick=291 iterations=48940017
+[workerA] tick=350 iterations=60766070

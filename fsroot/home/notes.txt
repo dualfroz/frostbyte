@@ -1,0 +1,2 @@
+nested directory entry in the ramdisk.
+the kernel created /home while walking the tar path home/notes.txt.

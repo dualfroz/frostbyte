@@ -1,0 +1,59 @@
+
+========================================
+  frostbyte kernel  x86_64  long mode
+  wave 2: userspace, ring 3, syscalls
+========================================
+
+[boot] multiboot2 magic verified (36d76289)
+[gdt]  kernel + user segments, tss slot reserved
+[idt]  256 vectors (32 exceptions, 16 irqs, int 0x80 syscall)
+[pic]  remapped to 0x20-0x2f, irq0 and irq1 unmasked
+[pmm]  130559 KiB usable, 32736 frames, 32439 free after kernel
+[heap] free-list allocator at 0x0000000000129000, 8192 KiB
+[heap] free-list allocator self-test:
+[heap]   alloc a=0x0000000000129020 b=0x00000000001290b0 c=0x00000000001291a0, live blocks=4
+[heap]   free(b) then malloc(150) -> d=0x00000000001290b0, reused b: yes
+[heap]   largest free 8191 KiB -> 8191 KiB after freeing a,c,d
+[heap]   coalesce PASS, 8191 KiB free of 8192 KiB, blocks=1
+[paging] mapped 0x00000000c0000000 -> phys 929000, readback OK
+[pit]  timer at 100 Hz
+[kbd]  ps/2 keyboard driver ready
+[tss]  loaded, rsp0 bootstrap stack installed
+[initrd] fbar mounted, 3 files
+[initrd] module at 0x0000000000123000-0x0000000000127638 (17 KiB)
+
+[boot] launching userland programs from initrd into ring 3
+[user] loaded 'hello' pid=4 entry=0x00000000400000b7 stackTop=0x0000000048000000 (5720 bytes)
+[user] loaded 'counter' pid=5 entry=0x00000000500000f2 stackTop=0x0000000058000000 (5880 bytes)
+[user] loaded 'sbrktest' pid=6 entry=0x0000000060000149 stackTop=0x0000000068000000 (6232 bytes)
+[sched] 7 threads total (idle, shell, 2 workers, user programs)
+
+[boot] enabling interrupts, starting preemptive scheduler
+
+
+frostbyte shell ready. type 'help'.
+frostbyte> hello: greetings from ring 3, pid=4
+counter: pid=5 step=0
+sbrktest: pid=6 requesting 8192 bytes via sbrk
+sbrktest: heap page write and read-back verified OK
+[user] pid=6 'sbrktest' exited with code 0
+hello: resumed after yield, exiting cleanly
+[user] pid=4 'hello' exited with code 7
+counter: pid=5 step=1
+counter: pid=5 step=2
+counter: pid=5 step=3
+counter: pid=5 step=4
+counter: finished counting
+[user] pid=5 'counter' exited with code 0
+[workerA] tick=50 iterations=9283703
+[workerB] tick=91 iterations=17208332
+[workerA] tick=150 iterations=28254555
+[workerB] tick=191 iterations=36253847
+[workerA] tick=250 iterations=46306517
+[workerB] tick=291 iterations=52985378
+[workerA] tick=350 iterations=61196592
+[workerB] tick=391 iterations=70967282
+[workerA] tick=450 iterations=79949479
+[workerB] tick=491 iterations=90111106
+[workerA] tick=550 iterations=98996653
+qemu-system-x86_64: terminating on signal 15 from pid 956094 (timeout)

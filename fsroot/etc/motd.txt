@@ -1,0 +1,5 @@
+frostbyte ramdisk file
+frostbyte-ustar-read-ok
+This text lives inside a USTAR (tar) image built by tools/mktar and handed to
+the kernel as a Multiboot2 module. Seeing this line on the serial port proves
+the kernel parsed the tar header and read the file body through the VFS.
