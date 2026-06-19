@@ -230,6 +230,66 @@ bool vfsPollReady(int fd, int16 events, int16* outRevents);
    mkfifo(2) special file survives a reboot while its pipe buffer does
    not): the live pipe.h handle two openers actually exchange bytes
    through is created lazily, in memory, the first time anyone opens the
+   path after boot (or after every previous session's ends have gone away),
+   same mechanism as the "/tmp"-style case above, just keyed by inode
+   number instead of living on a VfsNode (see vfs.c's sfsFifoHandleFor). */
+int vfsMkfifo(const char* path);
+
+/* "/dev/disk0" is a reserved path (not part of the mounted tree, same as
+   pipes) that opens the raw ATA disk as a byte-addressable device: reads
+   and writes at arbitrary offsets are translated to sector I/O through
+   ata.h, with read-modify-write for accesses that are not sector-aligned. */
+
+/* "/mnt" (and everything under it) is a second reserved path, backed by the
+   persistent on-disk filesystem in sfs.h/sfs.c rather than the kmalloc-based
+   VfsNode tree: open/read/write/close/lseek/stat/mkdir/unlink/getdents on a
+   "/mnt..." path are all dispatched to sfs.c, which stores the data on the
+   same ATA disk (a different LBA range than /dev/disk0's raw byte access,
+   see sfs.h). Data written there survives vfsInit() being called again,
+   because it lives on disk, not in this process's heap. */
+
+/* Real per-process chdir(2)/getcwd(2) (sched.h's Thread.cwd). Resolves
+   `path` against the CALLING thread's current cwd first (vfsResolvePath
+   below), so a relative argument works exactly like a real chdir() call,
+   then requires the result to already name a real directory -- under
+   "/mnt" (sfs.h) or in the ordinary VfsNode tree, checked the same way
+   vfsStat/vfsMkdir already dispatch on isSfsPath. Returns 0 on success (the
+   calling thread's own cwd is now that resolved absolute path) or -1,
+   changing nothing, if it does not name an existing directory. For a
+   VfsNode-tree directory (ustar/tmpfs), the stored result is canonicalized
+   by walking the resolved node's real parent chain (vfsPath below), so
+   "."/".." components the caller typed never survive into a later
+   vfsGetcwd(). "/mnt" (sfs.h) has no equivalent parent-walk primitive, so
+   THAT branch stores vfsResolvePath's own plain string join verbatim --
+   every path-taking entry point below already tolerates embedded "."/".."
+   wherever they appear regardless (see vfs.c's lookupNode/sfsLookup), so
+   later relative resolution still behaves correctly either way; only
+   vfsGetcwd's own output could then look non-canonical (e.g.
+   "/mnt/foo/../bar") for an "/mnt" cwd reached that way -- an
+   honestly-scoped simplification, not a fake canonicalization. */
+int vfsChdir(const char* path);
+
+/* Copies the calling thread's current working directory (always already
+   absolute, see vfsChdir above) into `out`, nul-terminated, and returns its
+   length -- or -1, writing nothing, if it does not fit `cap` (real
+   getcwd(2)'s own ERANGE case). */
+int64 vfsGetcwd(char* out, uint64 cap);
+
+/* Resolves `path` against the CALLING thread's own cwd (sched.h's
+   currentThreadCwd) into `out`: copied as-is (truncated to `cap`-1 if
+   necessary) if it already starts with '/', otherwise joined onto the cwd
+   exactly like a real relative open() would -- the same "cwd + '/' +
+   argument" shape shell.c's own long-standing buildPath already used for
+   its builtins, now the ONE place that logic lives. Every path-taking
+   public entry point below (vfsOpen, vfsOpenInto, vfsMkdir, vfsUnlink,
+   vfsRmdir, vfsStat, vfsSymlink's `path` argument -- never its `target`,
+   which is stored verbatim like a real symlink(2) -- vfsReadlink, vfsLink,
+   vfsMkfifo, vfsChmod) calls this internally before doing anything else, so an
+   already-absolute path built by hand (shell.c's own callers, unchanged)
+   keeps working exactly as before. Exposed so vfsChdir can resolve ITS OWN
+   argument the same way before ever storing it, keeping Thread.cwd always
+   fully absolute. */
+void vfsResolvePath(const char* path, char* out, uint64 cap);
 
 typedef struct VfsNode VfsNode;
 VfsNode* vfsLookup(const char* path);
@@ -239,6 +299,43 @@ const char* vfsName(VfsNode* node);
 bool vfsIsDir(VfsNode* node);
 uint64 vfsSize(VfsNode* node);
 const void* vfsFileData(VfsNode* node);
+
+/* Real owner rwx permission bits (fs.h's fsModeOwner*) for a tmpfs VfsNode
+   -- the exact same value vfsStat's tmpfs branch reports as FbStat.mode.
+   Exposed as its own accessor (VfsNode is opaque outside vfs.c, same reason
+   vfsSize/vfsFileData exist) so jobctl.c's jobctlSpawn can check
+   fsModeOwnerExec on an already-vfsLookup'd node before spawning it,
+   without a redundant vfsStat + path re-resolve. */
+uint32 vfsMode(VfsNode* node);
+
+/* Real owner identity (fs.h's FbStat.uid) for a tmpfs VfsNode -- the uid
+   that was currentThreadUid() at nodeAlloc time (vfs.c), mirroring
+   vfsMode's own "opaque outside vfs.c" exposure exactly, for the same
+   reason: syscall.c's loadImageByPath and jobctl.c's jobctlSpawn need this
+   on an already-vfsLookup'd node before deciding whether to spawn it. */
+uint32 vfsUid(VfsNode* node);
+
+/* Real group identity (fs.h's FbStat.gid) for a tmpfs VfsNode -- the gid
+   that was currentThreadGid() at nodeAlloc time, mirroring vfsUid's own
+   "opaque outside vfs.c" exposure for the same reason (syscall.c's
+   loadImageByPath, jobctl.c's jobctlSpawn). */
+uint32 vfsGid(VfsNode* node);
+
+/* Real Unix owner/group/other permission check (vfs.c): does the caller
+   (`callerUid`/`callerGid`) have `wantOwnerBit` (one of fs.h's fsModeOwner*
+   constants) against a node whose bits are `mode` and whose owner is
+   `ownerUid`/`ownerGid`? A matching uid checks the owner bit; else a
+   matching gid checks the corresponding "group" bit (fs.h's fsModeGroup*,
+   wantOwnerBit >> 3); else the corresponding "other" bit (fs.h's
+   fsModeOther*, wantOwnerBit >> 6) -- deliberately no uid-0-bypasses-
+   everything superuser rule (see vfsPermitted's own doc comment in vfs.c
+   for why). Exported (not just used internally by resolveOpen) so
+   syscall.c's loadImageByPath and jobctl.c's jobctlSpawn can run the
+   identical exec-bit check instead of each re-deriving this algorithm.
+   Pure function of its six arguments -- callers pass currentThreadUid()/
+   currentThreadGid() in explicitly, this never reads a live thread
+   itself. */
+bool vfsPermitted(uint32 mode, uint32 ownerUid, uint32 ownerGid, uint32 callerUid, uint32 callerGid, uint32 wantOwnerBit);
 void vfsPath(VfsNode* node, char* out, uint64 cap);
 
 #endif
