@@ -15,5 +15,59 @@
 #define sysGetdents 11
 #define sysMkdir    12
 #define sysUnlink   13
+#define sysPipe     14
+#define sysSymlink  15
+#define sysReadlink 16
+#define sysLink     17
+#define sysExec       18
+#define sysSpawn      19
+#define sysWait       20
+#define sysPipeCreate 21
+#define sysPipeAttach 22
+#define sysKill       23
+#define sysMkfifo     24
+#define sysSigSend     25
+#define sysSigAction   26
+#define sysSigProcMask 27
+#define sysSigReturn   28
+#define sysAlarm       29
+#define sysSetpgid     30
+#define sysGetpgid     31
+#define sysSetFgPgrp   32
+#define sysGetFgPgrp   33
+#define sysPoll        34
+#define sysChdir       35
+#define sysGetcwd      36
+#define sysGetEnv      37
+#define sysSetEnv      38
+#define sysNice        39
+#define sysGetPriority 40
+#define sysTime        41
+#define sysUnsetEnv    42
+#define sysRmdir       43
+#define sysChmod       44
+#define sysGetuid      45
+#define sysSetuid      46
+#define sysChown       47
+#define sysGetgid      48
+#define sysSetgid      49
+#define sysChgrp       50
+#define sysPidfdOpen   51
+#define sysPidfdSend   52
+#define sysPidfdWait   53
+#define sysMmap        54
+#define sysMunmap      55
+
+/* Sentinel pid for sysWait (syscall.c)/userWaitAny (ulib.c): real
+   waitpid(-1)-style "reap whichever child happens to already be dead,
+   without caring which specific pid" instead of the ordinary "wait for
+   exactly this one" contract every other sysWait id value has.
+   (unsigned int)-1 can never collide with a real pid, since pid 0 (idle)
+   and every id returned by threadCreate/threadCreateUser are always <
+   maxThreads (sched.c). Deliberately spelled with the plain C type, not
+   sched.h's uint32, so this header stays usable from userland (ulib.h/
+   ulib.c) exactly like fs.h/signalnum.h's own shared definitions already
+   are -- see fs.h's FbStat for the same convention. */
+#define waitAnyPid ((unsigned int)-1)
 
 #endif
