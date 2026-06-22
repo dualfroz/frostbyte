@@ -60,6 +60,10 @@ fillPd:
     movl $0xC0000080, %ecx
     rdmsr
     orl $(1 << 8), %eax
+    cmpl $0, cpuNxSupported
+    je 2f
+    orl $(1 << 11), %eax
+2:
     wrmsr
 
     movl %cr0, %eax
@@ -76,6 +80,16 @@ checkLongMode:
     jb noLongMode
     movl $0x80000001, %eax
     cpuid
+
+    /* Same cpuid leaf already gives us CPUID.80000001H:EDX.NX (bit 20) for
+       free -- stash it in cpuNxSupported (checked below, in %eax's later
+       rdmsr/wrmsr dance) before the LM (bit 29) test below, which does not
+       touch %edx, leaves it intact either way. */
+    movl $0, cpuNxSupported
+    testl $(1 << 20), %edx
+    jz 1f
+    movl $1, cpuNxSupported
+1:
     testl $(1 << 29), %edx
     jz noLongMode
     ret
@@ -110,6 +124,12 @@ bootGdtEnd:
 bootGdtPointer:
     .word bootGdtEnd - bootGdtStart - 1
     .quad bootGdtStart
+
+.section .boot.data, "aw", @progbits
+.align 4
+.global cpuNxSupported
+cpuNxSupported:
+    .long 0
 
 .section .boot.pagetables, "aw", @progbits
 .align 4096

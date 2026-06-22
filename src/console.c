@@ -43,13 +43,21 @@ static void writeUnsigned(uint64 value, uint32 base, bool upper, int minWidth, c
         kputchar(buffer[--length]);
 }
 
-static void writeSigned(int64 value)
+/* Mirrors klib.c's vsnprintf sinkPutSigned exactly (same minWidth/pad
+   contract, same "sign eats one column of the requested width" rule) --
+   found and fixed this fala after shell.c's new `ls -l` printed
+   "2026-9-7" instead of "2026-09-07": every prior kprintf call site that
+   wanted zero-padded fields (thread ids, sizes, hex addresses) happened
+   to use an unsigned specifier, so this signed-value width/pad bug went
+   completely unnoticed until the first zero-padded %d/%ld call ever
+   appeared. */
+static void writeSigned(int64 value, int minWidth, char pad)
 {
     if (value < 0) {
         kputchar('-');
-        writeUnsigned((uint64)(-value), 10, false, 0, ' ');
+        writeUnsigned((uint64)(-value), 10, false, minWidth > 0 ? minWidth - 1 : 0, pad);
     } else {
-        writeUnsigned((uint64)value, 10, false, 0, ' ');
+        writeUnsigned((uint64)value, 10, false, minWidth, pad);
     }
 }
 
@@ -93,7 +101,7 @@ void kprintf(const char* format, ...)
             break;
         case 'd':
         case 'i':
-            writeSigned(longCount ? va_arg(args, int64) : (int64)va_arg(args, int));
+            writeSigned(longCount ? va_arg(args, int64) : (int64)va_arg(args, int), width, pad);
             break;
         case 'u':
             writeUnsigned(longCount ? va_arg(args, uint64) : (uint64)va_arg(args, uint32), 10, false, width, pad);
