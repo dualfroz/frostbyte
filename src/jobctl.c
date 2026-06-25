@@ -315,3 +315,115 @@ uint32 jobctlSpawnForegroundHereString(const char* path, const char* const* argv
     if (pid == threadInvalidId)
         return threadInvalidId;
 
+    /* inPath is always nullptr here: fd 0 is already the here-string pipe
+       jobctlSpawnPipedHereString just wired up, exactly like a piped
+       stdin's slot in runPipeline (shell.c) is never ALSO given a file
+       redirect on the same fd. */
+    if (!jobctlApplyRedirects(pid, nullptr, outPath, outAppend, errPath, errAppend)) {
+        threadKill(pid);
+        threadJoin(pid);
+        return threadInvalidId;
+    }
+
+    keyboardSetForegroundPgid(pid);
+    return pid;
+}
+
+bool jobctlRunBackgroundHereString(const char* path, const char* const* argv, int argc,
+                                    const char* text, const char* outPath, bool outAppend,
+                                    const char* errPath, bool errAppend,
+                                    uint32* outPid)
+{
+    uint32 pid = jobctlSpawnPipedHereString(path, argv, argc, text, -1, threadInvalidId);
+    if (pid == threadInvalidId)
+        return false;
+
+    if (!jobctlApplyRedirects(pid, nullptr, outPath, outAppend, errPath, errAppend)) {
+        threadKill(pid);
+        threadJoin(pid);
+        return false;
+    }
+
+    *outPid = pid;
+    return true;
+}
+
+/* The mirror image of jobctlSpawnPipedHereString above: that one feeds a
+   fixed string INTO a freshly spawned child's stdin (the shell is the
+   writer), this one reads a freshly spawned child's stdout back OUT as a
+   string (the shell is the reader) -- shell.c's new `$(cmd)` command
+   substitution. Attaches this thread as the pipe's reader (pipeAddReader)
+   BEFORE jobctlSpawnPiped ever attaches the child as its writer, the exact
+   opposite order of jobctlSpawnPipedHereString's own writer-after-reader
+   ordering but for the same reason: whichever end never gets attached at
+   all must not let pipeCloseRead/pipeCloseWrite release the slot out from
+   under the other end while it is still in use. stdin is left at its plain
+   default (whatever fd 0 already is for this kernel thread, exactly like
+   jobctlRunBackground's own unpiped stdin) -- an honestly-scoped limitation
+   matching runPipelineStages' "no stage may be a builtin": a substituted
+   command that genuinely needs to read stdin itself has nothing useful
+   wired to it here, since command substitution has no argv-supplied input
+   of its own to give it.
+   Joins the child (threadJoin) BEFORE ever reading a single byte, then
+   drains whatever it wrote with plain non-blocking pipeRead calls -- the
+   opposite order of "read until EOF, then join" would deadlock in this
+   kernel every time: reclaimOpenFds (sched.c), which closes a dead
+   thread's own fd 1 and so is what actually makes pipeRead ever report
+   real end-of-file (writers reaching 0), runs ONLY from inside threadReap
+   (threadJoin's own last step), never from threadExit/threadKill
+   themselves -- a thread that has already died but not yet been reaped
+   still counts, from the pipe's own point of view, as holding fd 1 open.
+   Reading first would therefore block forever waiting for an EOF that can
+   only ever arrive AFTER the very threadJoin call that would come next.
+   Joining first instead means the child's own write(s) must already have
+   completed (and fit in the pipe's ring buffer without blocking on free
+   space, exactly like jobctlSpawnPipedHereString's own here-string write
+   already assumes for the identical pipeBufferSize=256 constant) by the
+   time it actually exits -- an honestly-scoped limitation this function
+   shares with that one: a substituted command whose own combined stdout
+   exceeds pipeBufferSize bytes would block on a full buffer waiting for a
+   reader that will not start draining until this function's own
+   threadJoin below returns, which itself requires the write to unblock
+   first -- the same ordering deadlock in the opposite direction, avoided
+   here simply by staying within the same generous margin every other
+   pipeBufferSize-sized fixed buffer in this kernel already relies on.
+   Copies at most outCap-1 bytes into outBuf (NUL-terminated); any further
+   buffered bytes past that are still drained (into a small scratch
+   buffer, discarded) rather than left sitting in the pipe. *outStatus
+   receives the child's real exit code. Returns false, touching neither
+   outBuf nor *outStatus, on the same load/spawn failures as
+   jobctlSpawnPiped, or if the pipe table itself is exhausted
+   (vfsPipeCreateHandle). */
+bool jobctlCaptureOutput(const char* path, const char* const* argv, int argc,
+                          char* outBuf, int outCap, int64* outStatus)
+{
+    int handle = vfsPipeCreateHandle();
+    if (handle < 0)
+        return false;
+
+    pipeAddReader(handle);
+
+    uint32 pid = jobctlSpawnPiped(path, argv, argc, -1, handle, threadInvalidId);
+    if (pid == threadInvalidId) {
+        pipeCloseRead(handle);
+        return false;
+    }
+
+    *outStatus = threadJoin(pid);
+
+    int used = 0;
+    char scratch[64];
+    for (;;) {
+        int64 n = (used < outCap - 1)
+            ? pipeRead(handle, outBuf + used, (uint64)(outCap - 1 - used))
+            : pipeRead(handle, scratch, sizeof(scratch));
+        if (n <= 0)
+            break;
+        if (used < outCap - 1)
+            used += (int)n;
+    }
+    outBuf[used] = 0;
+
+    pipeCloseRead(handle);
+    return true;
+}
