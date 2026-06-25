@@ -1369,6 +1369,179 @@ static void envTypeEnvprintCommand(void)
     injectKeyPress(scancodeMakeR);
     injectKeyPress(scancodeMakeI);
     injectKeyPress(scancodeMakeN);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+static void envTypeEnvCommand(void)
+{
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeMakeN);
+    injectKeyPress(scancodeMakeV);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+/* 12500ms gives threeStagePipelineDriverThread's own total budget
+   (10700+600=11300ms, above its own real 3-process pipeline run time) a
+   comfortable margin before this thread ever touches the same shared
+   keyboard buffer, the same "next demo's initial delay clears the
+   previous demo's total budget" convention every driver thread above
+   already established. Settle is 400ms per step -- envprint (unlike most
+   earlier demos) never blocks on anything (no pipe, no fifo, no signal),
+   it just runs two syscalls and prints, so this is comfortable headroom
+   rather than a tightly reasoned minimum. */
+#define envDriverInitialDelayMs 12500
+#define envDriverStepSettleMs   400
+
+/*
+ * Live ring-3 proof for the new real environment-variable subsystem
+ * (sched.h's Thread.env, syscall.c's sysGetEnv/sysSetEnv, shell.c's new
+ * `export`/`env` builtins and `$NAME` expansion): types "export
+ * GREETING=frostbyte" at the real interactive shell (sets it in the
+ * SHELL's own Thread.env, currentThreadSetEnv), then "envprint" (loaded
+ * on demand, /bin/envprint -- proves the freshly spawned child inherited
+ * a real copy via initialEnv and that its own later userSetEnv is visible
+ * to itself), then a final bare "env" (shell.c's listing builtin) whose
+ * output is the actual proof of isolation: if envprint.c's own
+ * userSetEnv("GREETING", "child-mutated") had somehow reached back into
+ * the PARENT shell's table (a shared-pointer bug, not the real
+ * independent-copy semantics initialEnv gives), this "env" would print
+ * "child-mutated" instead of the original "frostbyte" -- the same
+ * "child's own later mutation is proven not to leak back" shape
+ * cwdtest.c's post-userWait getcwd() check already established for
+ * per-process cwd. The actual pass/fail proof for the first two commands
+ * is entirely envprint.c's own doing; this thread's only job is to type
+ * the three commands and give the scheduler real time between them.
+ */
+static void envDriverThread(void)
+{
+    threadSleep(envDriverInitialDelayMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    kprintf("[kbd]  typing shell commands for the environment variable demo\n");
+    jobctlTypeFlushLine();
+
+    envTypeExportCommand();
+    threadSleep(envDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    envTypeEnvprintCommand();
+    threadSleep(envDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    envTypeEnvCommand();
+    threadSleep(envDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    for (;;)
+        halt();
+}
+
+/* '*' is shift+8 on a real US keyboard -- keyboard.c's scancodeUpper table
+   maps index scancodeMakeEight (the same physical key as scancodeLower's
+   plain '8') to '*' only while shiftHeld is true, the same convention
+   scancodeMakeDot/scancodeMakeComma above already use for '>'/'<'. No
+   other new letter is needed for this demo's five commands -- every letter
+   "mkdir"/"echo"/"globcat"/"tmp"/"gd"/"txt"/"log" needs (m,k,d,i,r,e,c,h,o,
+   g,l,b,a,t,p,x,s) was already defined by an earlier block. */
+#define scancodeMakeEight 0x09
+
+static void globTypeMkdirCommand(void)
+{
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeK);
+    injectKeyPress(scancodeMakeD);
+    injectKeyPress(scancodeMakeI);
+    injectKeyPress(scancodeMakeR);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeP);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeD);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+static void globTypeEchoACommand(void)
+{
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeH);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeA);
+    injectKeyPress(scancodeMakeSpace);
+    injectShiftedKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeP);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeD);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeA);
+    injectKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeX);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+static void globTypeEchoBCommand(void)
+{
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeH);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeB);
+    injectKeyPress(scancodeMakeSpace);
+    injectShiftedKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeP);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeD);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeB);
+    injectKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeX);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+/* Writes /tmp/gd/c.log (NOT .txt) -- the sibling file globTypeGlobcatCommand
+   below's own "*.txt" pattern must NOT match, proving shellExpandGlobs
+   really filters by pattern instead of just listing the whole directory. */
+static void globTypeEchoSkipCommand(void)
+{
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeH);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeSpace);
+    injectShiftedKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeP);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeG);
 }
 
 void kmain(uint32 magic, uint64 multibootInfo)
