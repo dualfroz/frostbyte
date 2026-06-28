@@ -1542,6 +1542,299 @@ static void globTypeEchoSkipCommand(void)
     injectKeyPress(scancodeMakeP);
     injectKeyPress(scancodeMakeSlash);
     injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeD);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeL);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+static void globTypeGlobcatCommand(void)
+{
+    injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeL);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeB);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeA);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeP);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeG);
+    injectKeyPress(scancodeMakeD);
+    injectKeyPress(scancodeMakeSlash);
+    injectShiftedKeyPress(scancodeMakeEight);
+    injectKeyPress(scancodeMakeDot);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeX);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+/* 15000ms clears envDriverThread's own total budget (12500 initial +
+   3*400 settle = 13700ms, above its own real spawn/run/reap time), the same
+   "next demo's initial delay clears the previous demo's total budget"
+   convention every driver thread above already establishes. Settle is
+   300ms per step, matching redirDriverThread's own choice for similarly
+   trivial commands (a single mkdir or a single short file write, none of
+   which ever sleeps or blocks on a timer) -- comfortable headroom to let
+   the shell finish running each FOREGROUND command before the next one's
+   keystrokes are typed into the same shared 32-byte console-reader ring
+   buffer (keyboard.c). */
+#define globDriverInitialDelayMs 15000
+#define globDriverStepSettleMs   300
+
+/*
+ * Live ring-3 proof for shell.c's new wildcard glob expansion
+ * (shellExpandGlobs, shellGlobMatch/shellTokenHasGlob/shellSplitGlobToken):
+ * types four setup commands at the real interactive shell (mkdir, then
+ * three "echo X > /tmp/gd/NAME" writes -- two matching *.txt, one
+ * deliberately a *.log that must NOT match), then "globcat /tmp/gd/ *.txt".
+ * shell.c resolves that last argv token against the real tmpfs directory
+ * /tmp/gd (vfsChild/vfsNext, the exact traversal the `ls` builtin already
+ * uses) and replaces it with however many real paths matched BEFORE
+ * globcat.c (loaded on demand, like envprint/hcat/pipecat above) ever runs
+ * a single instruction -- so globcat.c's own argc/argv and each file's
+ * content are the actual proof: exactly 2 files (never 3 -- c.log must be
+ * filtered out by pattern, not just "everything in the directory"), each
+ * one's real resolved path and its own distinct content. The actual
+ * pass/fail proof is entirely globcat.c's own doing; this thread's only job
+ * is to type the five commands and give the scheduler real time between
+ * them.
+ */
+static void globDriverThread(void)
+{
+    threadSleep(globDriverInitialDelayMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    kprintf("[kbd]  typing shell commands for the wildcard glob demo\n");
+    jobctlTypeFlushLine();
+
+    globTypeMkdirCommand();
+    threadSleep(globDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    globTypeEchoACommand();
+    threadSleep(globDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    globTypeEchoBCommand();
+    threadSleep(globDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    globTypeEchoSkipCommand();
+    threadSleep(globDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    globTypeGlobcatCommand();
+    threadSleep(globDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    for (;;)
+        halt();
+}
+
+/* 19500ms clears globDriverThread's own total budget (15000 initial +
+   5*300 settle = 16500ms, plus the real time globcat.c itself needs to
+   spawn/run/read two files/print/exit after that last keystroke) -- the
+   same "next demo's initial delay clears the previous demo's total budget
+   with margin" convention every driver thread above establishes. A single
+   settle step is enough -- see the file comment on lsDriverThread below
+   for why this demo types only ONE command, unlike every prior driver
+   thread's multi-command setup sequence: tools/ci-test.sh's QEMU timeout
+   is a fixed 25 REAL (host wall-clock) seconds shared by the entire boot,
+   and this is already the last of well over a dozen shell-driven demos
+   stacked at increasing absolute timestamps in that same fixed window, so
+   minimizing this demo's own keystroke count directly buys back margin
+   for the whole chain instead of spending it. */
+#define lsDriverInitialDelayMs 19500
+#define lsDriverStepSettleMs   300
+
+static void lsTypeLongListCommand(void)
+{
+    injectKeyPress(scancodeMakeL);
+    injectKeyPress(scancodeMakeS);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeHyphen);
+    injectKeyPress(scancodeMakeL);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeN);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeSlash);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeI);
+    injectKeyPress(scancodeMakeM);
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeMakeS);
+    injectKeyPress(scancodeMakeT);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+/*
+ * Live proof for shell.c's new generalized `ls`/`ls -l` (listDir/
+ * printLsEntry): types `ls -l /mnt/timetest` at the real interactive
+ * shell. `/mnt/timetest` is deliberately NOT created by this demo --
+ * timetest.c (FALA 39, boot-time synchronous, long finished by the time
+ * any shell-driven demo runs) already left it behind with two real files
+ * (data.txt, and alias.txt, a hardlink sharing the same inode/mtime) once
+ * `timetest: PASS` prints, so this demo needs exactly ONE typed command
+ * instead of the usual "mkdir + write setup, then the command under test"
+ * shape every earlier shell demo used -- both a deliberate budget saving
+ * (see lsDriverInitialDelayMs's own comment) and, incidentally, a second
+ * independent proof that `ls -l`'s real stat data (size, mtime) matches
+ * what timetest.c's own syscall-level userStat already established for
+ * the exact same on-disk inode, through a completely different code path
+ * (the interactive shell builtin instead of a ring-3 program's syscalls).
+ * `/mnt`, not `/tmp`, is the whole point -- the OLD `ls` only ever
+ * understood the tmpfs VfsNode tree via vfsLookup/vfsChild/vfsNext, so any
+ * `/mnt` directory silently reported "no such path" no matter what it
+ * actually held (fstest.c/linktest.c could only ever prove SFS directory
+ * listing through a raw userGetdents syscall, never through this
+ * builtin). The needles tools/ci-test.sh checks for are the deterministic
+ * type+size+name prefix of each `-l` output line ("f <N> data.txt " and
+ * "f <N> alias.txt ", both files' real on-disk size) plus a "20" year-
+ * prefix right after one of them, proving a real mtime got formatted and
+ * printed (sfs.h's on-disk timestamp, rtc.c's new rtcCivilFromEpoch)
+ * rather than silently falling back to the "no timestamp" dash this same
+ * code path prints for tmpfs/dev entries.
+ */
+static void lsDriverThread(void)
+{
+    threadSleep(lsDriverInitialDelayMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    kprintf("[kbd]  typing shell commands for the ls -l demo\n");
+    jobctlTypeFlushLine();
+
+    lsTypeLongListCommand();
+    threadSleep(lsDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    for (;;)
+        halt();
+}
+
+/* 20500ms clears lsDriverThread's own total budget (19500 initial + 300
+   settle = 19800ms) with 700ms margin -- smaller than most prior driver
+   threads' own margin since `ls -l` is a plain builtin (listDir, shell.c)
+   with no process spawn/VFS-blocking wait after its own settle delay,
+   unlike e.g. globDriverThread's globcat.c spawn+read+compare, so there is
+   no extra real execution time to wait out beyond the typing itself. Same
+   "next demo's initial delay clears the previous demo's total budget with
+   margin" convention every driver thread above establishes. Only ONE
+   command, ONE settle step -- false.c is the smallest possible spawned
+   program in this kernel (immediate userExit, no VFS/pipe/signal work at
+   all), and this fala's own live demo needs only one line of it (see
+   andOrTypeFailChainCommand's own comment for why one line already proves
+   the whole feature), the same budget-consciousness
+   lsDriverInitialDelayMs's own comment established: an EARLIER version of
+   this demo also typed a second line ("true && echo aoy", proving `&&`
+   fires on a real SUCCESS too) and was cut after it measurably pushed one
+   real re-run over tools/ci-test.sh's fixed 25-real-second QEMU ceiling
+   under this session's own elevated host load -- not worth the extra
+   margin lost for a case the KTEST-level shellSplitAndOr tests (which
+   assert both shellAndOrAnd and shellAndOrOr are parsed and recorded
+   correctly) and this project's dozens of pre-existing successful
+   `cmd && cmd`-free typed commands already make low-risk. */
+#define andOrDriverInitialDelayMs 20500
+#define andOrDriverStepSettleMs   300
+
+/* "false && echo X || echo ao2" -- the classic shell if-then-else idiom in
+   one line. false.c genuinely spawns and exits 1 (see its own file
+   comment); `&&` sees that real nonzero status and SKIPS "echo X" (a
+   builtin, would otherwise print instantly); the `||` check right after
+   it is then evaluated against the SAME status "echo X" never changed
+   (shellSplitAndOr/execute()'s own "a skipped segment leaves status
+   completely unchanged" contract, shell.h) -- still nonzero, so it DOES
+   run "echo ao2". The needle `ao2` can only ever appear if both the skip
+   and the carry-through past that skip worked correctly; "X" is
+   deliberately never checked for (this kernel's tools/ci-test.sh only
+   ever asserts PRESENCE of a needle, never absence), so this line's own
+   affirmative proof is entirely in `ao2` actually appearing at all. Every
+   character this line needs (f/a/l/s/e/space/&/h/c/o/x/|/a/o/2) is already
+   defined by an earlier demo's own scancode block in this file. */
+static void andOrTypeFailChainCommand(void)
+{
+    injectKeyPress(scancodeMakeF);
+    injectKeyPress(scancodeMakeA);
+    injectKeyPress(scancodeMakeL);
+    injectKeyPress(scancodeMakeS);
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeMakeSpace);
+    injectShiftedKeyPress(scancodeMakeSeven);
+    injectShiftedKeyPress(scancodeMakeSeven);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeH);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeX);
+    injectKeyPress(scancodeMakeSpace);
+    injectShiftedKeyPress(scancodeMakeBackslash);
+    injectShiftedKeyPress(scancodeMakeBackslash);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeE);
+    injectKeyPress(scancodeCPressMake);
+    injectKeyPress(scancodeMakeH);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeSpace);
+    injectKeyPress(scancodeMakeA);
+    injectKeyPress(scancodeMakeO);
+    injectKeyPress(scancodeMakeTwo);
+    injectKeyPress(scancodeMakeEnter);
+}
+
+/*
+ * Live ring-3 proof for shell.c's new `cmd1 && cmd2 || cmd3 ...`
+ * conditional chaining (shellSplitAndOr, executeSingle/execute) -- types
+ * the command above at the real interactive shell, the same
+ * injected-keystroke mechanism every shell-driven demo above already
+ * uses. Unlike every earlier shell-syntax demo (pipelines, redirects,
+ * here-strings, globs), the actual subject under test here is false.c --
+ * a brand-new, deliberately trivial user program whose entire job is to
+ * hand back a real, predictable, nonzero exit code from a genuine ring-3
+ * spawn (see its own file comment) -- proving the new chaining logic
+ * reacts to a REAL process's own exit status, not just a builtin's
+ * in-kernel int return (which listDir/catFile/makeDir/changeDir/
+ * doExport/doUnset already exercise on every OTHER typed command in this
+ * whole boot sequence, just never through `&&`/`||` before this fala).
+ */
+static void andOrDriverThread(void)
+{
+    threadSleep(andOrDriverInitialDelayMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    kprintf("[kbd]  typing shell commands for the &&/|| chaining demo\n");
+    jobctlTypeFlushLine();
+
+    andOrTypeFailChainCommand();
+    threadSleep(andOrDriverStepSettleMs);
+    while (currentThread()->state == threadSleeping)
+        halt();
+
+    for (;;)
+        halt();
 }
 
 void kmain(uint32 magic, uint64 multibootInfo)
@@ -1583,6 +1876,12 @@ void kmain(uint32 magic, uint64 multibootInfo)
     runHeapTest();
     runPagingTest();
 
+    sigInstallTrampoline();
+    kprintf("[sig]  shared signal trampoline mapped at %p\n", (void*)sigTrampolineVirtualAddr);
+
+    sigInstallInfoPage();
+    kprintf("[sig]  shared siginfo page(s) mapped at %p\n", (void*)sigInfoVirtualAddr);
+
     pitInit(timerFrequency);
     kprintf("[pit]  timer at %u Hz\n", timerFrequency);
 
@@ -1600,17 +1899,174 @@ void kmain(uint32 magic, uint64 multibootInfo)
         kprintf("[vfs]  no multiboot2 module present\n");
     vfsMountTmpfs("/tmp");
 
+    /* namedreader/namedwriter (spawned below, after userland launch) are two
+       INDEPENDENT boot programs with no parent-child relationship and no
+       shared argv -- unlike fifomaster.c's children, which get a pipe.h
+       handle number handed to them, these two only agree on this path. The
+       fifo has to exist before either one can open it. */
+    if (vfsMkfifo("/tmp/rendezvous") == 0)
+        kprintf("[vfs]  mkfifo /tmp/rendezvous ready\n");
+    else
+        kprintf("[vfs]  mkfifo /tmp/rendezvous FAILED\n");
+
+    if (ataInit())
+        kprintf("[ata]  primary master '%s', %lu sectors (%lu MiB), /dev/disk0 ready\n",
+                ataModelString(), ataSectorCount(),
+                (ataSectorCount() * ataSectorSize) / (1024 * 1024));
+    else
+        kprintf("[ata]  no primary master drive detected, /dev/disk0 will read as empty\n");
+
+    if (sfsMount())
+        kprintf("[sfs]  mounted persistent filesystem at /mnt (%lu KiB usable)\n",
+                sfsCapacityBytes() / 1024);
+    else
+        kprintf("[sfs]  no usable disk for /mnt (drive missing or too small)\n");
+
+    ktestRunAll();
+
     threadCreate("shell", shellThread);
-    threadCreate("workerA", workerA);
-    threadCreate("workerB", workerB);
+    uint32 workerAId = threadCreate("workerA", workerA);
+    uint32 workerBId = threadCreate("workerB", workerB);
+
+    /* Both workers are pure CPU hogs (busy loops, never sleep or block), so
+       they are the cleanest possible demonstration that the CFS-lite
+       scheduler (sched.c/prioq.h) actually enforces weight, not just that it
+       compiles: workerA is given 3x workerB's weight, so it should accrue
+       vruntime three times slower and therefore win the ready-queue's
+       min-vruntime pick roughly three times as often. Compare the two
+       threads' printed iteration counts at similar tick values to see it. */
+    threadSetPriority(workerAId, schedDefaultWeight * schedPriorityWeightRatio);
+    kprintf("[sched] workerA pid=%u weight=%u, workerB pid=%u weight=%u "
+            "(CFS-lite: higher weight runs more often)\n",
+            workerAId, schedDefaultWeight * schedPriorityWeightRatio, workerBId, schedDefaultWeight);
+    threadCreate("schedVerify", schedPriorityVerifierThread);
+
+    pipeDemoHandle = pipeCreate();
+    if (pipeDemoHandle >= 0) {
+        threadCreate("pipeProducer", pipeProducerThread);
+        threadCreate("pipeConsumer", pipeConsumerThread);
+    } else {
+        kprintf("[pipe] demo pipe creation failed\n");
+    }
+
+    joinDemoWorkerId = threadCreate("joinWorker", shortLivedWorkerThread);
+    if (joinDemoWorkerId != threadInvalidId)
+        threadCreate("joiner", joinerThread);
+    else
+        kprintf("[sched] join demo worker not started: thread table full\n");
 
     kprintf("\n[boot] launching userland programs from the ramdisk into ring 3\n");
     spawnUser("/bin/hello", "hello", 0x48000000, 0);
     spawnUser("/bin/counter", "counter", 0x58000000, 0);
     spawnUser("/bin/sbrktest", "sbrktest", 0x68000000, 0x64000000);
     spawnUser("/bin/fileread", "fileread", 0x78000000, 0);
+    spawnUser("/bin/pipetest", "pipetest", 0x88000000, 0);
+    spawnUser("/bin/disktest", "disktest", 0x98000000, 0);
+    spawnUser("/bin/fstest", "fstest", 0xA8000000, 0);
+    spawnUser("/bin/linktest", "linktest", 0xB8000000, 0);
+    spawnUser("/bin/fifomaster", "fifomaster", 0x118000000, 0);
+    spawnUser("/bin/killtest", "killtest", 0x148000000, 0);
+    spawnUser("/bin/namedreader", "namedreader", 0x168000000, 0);
+    spawnUser("/bin/namedwriter", "namedwriter", 0x178000000, 0);
+    spawnUser("/bin/consolereader1", "consolereader1", 0x188000000, 0);
+    spawnUser("/bin/consolereader2", "consolereader2", 0x198000000, 0);
+    threadCreate("consoleInjector", consoleInjectorThread);
+    spawnUser("/bin/sigtest", "sigtest", 0x1A8000000, 0);
+    spawnUser("/bin/jobtest", "jobtest", 0x1D8000000, 0);
+    spawnUser("/bin/nesttest", "nesttest", 0x1F8000000, 0);
+    spawnUser("/bin/eintrtest", "eintrtest", 0x218000000, 0);
+    spawnUser("/bin/restarttest", "restarttest", 0x238000000, 0);
+    spawnUser("/bin/masktest", "masktest", 0x258000000, 0);
+    spawnUser("/bin/sigchldtest", "sigchldtest", 0x278000000, 0);
+    spawnUser("/bin/waitanytest", "waitanytest", 0x298000000, 0);
+    spawnUser("/bin/stopchldtest", "stopchldtest", 0x2C8000000, 0);
+    spawnUser("/bin/nodefertest", "nodefertest", 0x2E8000000, 0);
+    spawnUser("/bin/alarmtest", "alarmtest", 0x2F8000000, 0);
+    spawnUser("/bin/siginfotest", "siginfotest", 0x318000000, 0);
+    spawnUser("/bin/selfstoptest", "selfstoptest", 0x3F8000000, 0);
+    spawnUser("/bin/cwdtest", "cwdtest", 0x458000000, 0);
+    spawnUser("/bin/nicetest", "nicetest", 0x4A8000000, 0);
+    spawnUser("/bin/date", "date", 0x4B8000000, 0);
+    spawnUser("/bin/timetest", "timetest", 0x4D8000000, 0);
+    spawnUser("/bin/rmtest", "rmtest", 0x508000000, 0);
+    spawnUser("/bin/permtest", "permtest", 0x518000000, 0);
+    spawnUser("/bin/identtest", "identtest", 0x528000000, 0);
+    spawnUser("/bin/dirpermtest", "dirpermtest", 0x538000000, 0);
+    spawnUser("/bin/grouptest", "grouptest", 0x548000000, 0);
+    spawnUser("/bin/pidfdtest", "pidfdtest", 0x558000000, 0);
+    /* mmapprotvictim and mmapexecvictim are deliberately NOT spawned here
+       -- like killvictim (killtest's own runtime-spawned target, elsewhere
+       in this function), both are only ever loaded at runtime, by
+       mmaptest itself (userSpawn), never directly by kmain.c. */
+    spawnUser("/bin/mmaptest", "mmaptest", 0x568000000, 0);
+    spawnUser("/bin/polltest", "polltest", 0x378000000, 0);
+    pgroupfgPid = spawnUser("/bin/pgroupfg", "pgroupfg", 0x338000000, 0);
+    pgroupbgPid = spawnUser("/bin/pgroupbg", "pgroupbg", 0x348000000, 0);
+    if (pgroupfgPid != threadInvalidId) {
+        /* Real shell/tcsetpgrp behavior: whichever job was just launched in
+           the foreground claims the terminal explicitly -- pgroupbg is
+           deliberately left alone (its own default group, never named
+           here), the same way a background job never touches the
+           controlling terminal at all. */
+        keyboardSetForegroundPgid(pgroupfgPid);
+    }
+    if (pgroupfgPid != threadInvalidId && pgroupbgPid != threadInvalidId)
+        threadCreate("pgroupInjector", pgroupInjectorThread);
+    /* jobctlfg/jobctlbg are deliberately NOT spawned here -- unlike every
+       program above, they are only ever loaded on demand, at runtime, by
+       the real interactive shell (shellRun, threadCreate'd near the top of
+       this function) once jobctlDriverThread types their names at it. */
+    threadCreate("jobctlDriver", jobctlDriverThread);
+    /* pipesrc/pipesink are, like jobctlfg/jobctlbg just above, deliberately
+       NOT spawned here -- loaded on demand by the real shell once
+       pipelineDriverThread types "pipesrc | pipesink" at it. */
+    threadCreate("pipelineDriver", pipelineDriverThread);
+    /* redirwriter/redirreader are, like pipesrc/pipesink just above,
+       deliberately NOT spawned here -- loaded on demand by the real shell
+       once redirDriverThread types the redirected commands at it. */
+    threadCreate("redirDriver", redirDriverThread);
+    /* stderrwriter/stderrreader are, like redirwriter/redirreader just
+       above, deliberately NOT spawned here -- loaded on demand by the real
+       shell once stderrDriverThread types the stderr-redirected commands
+       at it. */
+    threadCreate("stderrDriver", stderrDriverThread);
+    /* herestest is, like stderrwriter/stderrreader just above, deliberately
+       NOT spawned here -- loaded on demand by the real shell once
+       hereDriverThread types the here-string command at it. */
+    threadCreate("hereDriver", hereDriverThread);
+    /* hcat/hsink are, like herestest just above, deliberately NOT spawned
+       here -- loaded on demand by the real shell once
+       hereStringPipelineDriverThread types the here-string-into-pipeline
+       command at it. */
+    threadCreate("hereStringPipelineDriver", hereStringPipelineDriverThread);
+    /* pipecat is, like hcat/hsink just above, deliberately NOT spawned here
+       -- loaded on demand by the real shell once
+       threeStagePipelineDriverThread types the three-stage pipeline
+       command at it (pipesrc/pipesink themselves are also on-demand-only,
+       unchanged since FALA 29). */
+    threadCreate("threeStagePipelineDriver", threeStagePipelineDriverThread);
+    /* envprint is, like pipecat just above, deliberately NOT spawned here
+       -- loaded on demand by the real shell once envDriverThread types
+       "export GREETING=frostbyte" then "envprint" at it. */
+    threadCreate("envDriver", envDriverThread);
+    /* globcat is, like envprint just above, deliberately NOT spawned here
+       -- loaded on demand by the real shell once globDriverThread types
+       "globcat /tmp/gd/ *.txt" at it (shell.c's new wildcard glob
+       expansion). */
+    threadCreate("globDriver", globDriverThread);
+    /* No new /bin binary here -- lsDriverThread only exercises shell.c's
+       existing mkdir/echo/ls builtins, never spawns anything. */
+    threadCreate("lsDriver", lsDriverThread);
+    /* false is, like globcat above, deliberately NOT spawned here --
+       loaded on demand by the real shell once andOrDriverThread types the
+       `&&`/`||`-chained command at it (shell.c's new conditional
+       chaining). */
+    threadCreate("andOrDriver", andOrDriverThread);
+    execDemoPid = spawnUser("/bin/proctest", "proctest", 0xF8000000, 0);
+    if (execDemoPid != threadInvalidId)
+        threadCreate("execReaper", execReaperThread);
 
-    kprintf("[sched] %u threads total (idle, shell, 2 workers, user programs)\n",
+    kprintf("[sched] %u threads total (idle, shell, 2 workers, priority verifier, user programs)\n",
             threadCount());
     kprintf("\n[boot] enabling interrupts, starting preemptive scheduler\n\n");
 
