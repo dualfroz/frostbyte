@@ -96,9 +96,30 @@ void pmmInit(uint64 multibootInfo, uint64 protectedEnd)
 
     frameCount = highestAddr / frameSize;
 
+    /* The bitmap itself must never overlap live data this function still
+       needs to read (or that anything else placed physically-here still
+       needs): the loaded kernel image, the multiboot module the caller has
+       already claimed via protectedEnd (typically the initrd, see
+       kmain.c), AND the multiboot info structure this very function is
+       reading `mmap` out of via endAddr, computed above. That last one is
+       not academic -- GRUB places the multiboot2 info block immediately
+       after the last module it loads, so protectedEnd (the module's own
+       end) and multibootInfo's start can legitimately land on the exact
+       same address. Anchoring on protectedEnd alone would then place the
+       bitmap ON TOP of the live mmap tag, and the memset just below would
+       zero out every entry's baseAddr/length/type with 0xFF *before* the
+       markFree pass a few lines down ever reads them -- silently losing
+       the entire usable-memory picture and leaving every frame "used"
+       forever. Growing the initrd (adding another user program, say) is
+       exactly what nudges protectedEnd into colliding with endAddr, so
+       this is not a hypothetical: it reproduced on the very next boot after
+       tools/mktar's ramdisk grew past whatever margin happened to exist
+       before. */
     uint64 bitmapAnchor = (uint64)kernelPhysEnd;
     if (protectedEnd > bitmapAnchor)
         bitmapAnchor = protectedEnd;
+    if (endAddr > bitmapAnchor)
+        bitmapAnchor = endAddr;
     bitmap = (uint8*)alignUp(bitmapAnchor, frameSize);
     uint64 bitmapBytes = (frameCount + 7) / 8;
     memset(bitmap, 0xFF, bitmapBytes);
