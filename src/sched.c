@@ -189,12 +189,114 @@
    bumped ahead of that again (176 -> 184) instead of waiting to observe it,
    same reasoning as every bump above. cwdtest (boot-time spawned, real
    per-process working directory live demo -- sched.h's new Thread.cwd)
+   plus cwdtarget (1 more, runtime-spawned by cwdtest itself, the same
+   *test / *target relationship jobtest/jobtarget already have) are two
+   more concurrently live threads, so bumped again (184 -> 192) for the
+   same headroom reason as every bump above. envprint (loaded on demand by
+   the real shell, like jobctlfg/hcat/pipecat above, never boot-spawned)
+   plus a kernel-only driver thread (kmain.c's envDriverThread, which types
+   `export`/`envprint`/`env` at the real shell through the same
+   injected-keystroke mechanism every driver thread above already uses)
+   would immediately re-create the exact same class of bug, so bumped
+   ahead of that again (192 -> 200) instead of waiting to observe it, same
+   reasoning as every bump above. nicetest (boot-time spawned, real
+   userspace-triggered sysNice/sysGetPriority live demo) plus nicetarget
+   (1 more, runtime-spawned by nicetest itself while sleeping so it can be
+   reniced while blocked, the same *test / *target relationship
+   jobtest/jobtarget and cwdtest/cwdtarget already have) are two more
+   concurrently live threads, so bumped again (200 -> 208) for the same
+   headroom reason as every bump above. date (boot-time spawned, real
+   sysTime/rtc.c live demo, fully synchronous like nicetest with no
+   runtime-spawned partner of its own) is one more, so bumped again
+   (208 -> 216) for the same headroom reason as every bump above. timetest
+   (boot-time spawned, real SFS inode mtime/ctime live demo through userOpen/
+   userWrite/userStat/userLink, fully synchronous like nicetest/date with no
+   runtime-spawned partner) is one more, so bumped again (216 -> 224) for the
+   same headroom reason as every bump above. lsDriverThread (kmain.c, boot-
+   time kernel thread that types `mkdir`/`echo`/`ls -l` at the real shell
+   for shell.c's new generalized `ls` builtin) is one more, so bumped again
+   (224 -> 232) for the same headroom reason as every bump above.
+   andOrDriverThread (kmain.c, boot-time kernel thread that types
+   `false && echo X || echo ao2` at the real shell for shell.c's new
+   `&&`/`||` conditional chaining) is one more, so bumped again
+   (232 -> 240) for the same headroom reason as every bump above. rmtest
+   (boot-time spawned, real vfsRmdir/sysRmdir unlink(2)-vs-rmdir(2) split
+   live demo on both tmpfs and SFS, fully synchronous like nicetest/date/
+   timetest with no runtime-spawned partner) is one more, so bumped again
+   (240 -> 248) for the same headroom reason as every bump above. permtest
+   (boot-time spawned, real chmod(2)/owner-rwx-permission-bits live demo)
+   plus the one short-lived runtime-spawned copy of /bin/false it chmods and
+   spawns to prove the exec-permission check, are two more concurrently
+   live threads, so bumped again (248 -> 256) for the same headroom reason
+   as every bump above. dirpermtest (boot-time spawned, real directory-mode
+   enforcement live demo -- vfsMkdir/resolveOpen/vfsUnlink/vfsRmdir's new
+   parent-write and ancestor-search checks, lookupNode/lookupFrom's new
+   exec-on-traversal check -- fully synchronous like identtest with no
+   runtime-spawned partner) is one more, so bumped again (256 -> 264) for
+   the same headroom reason as every bump above. grouptest (boot-time
+   spawned, real group-credential/vfsPermitted-group-branch live demo plus
+   the two short-lived runtime-spawned copies of /bin/false it group-execs
+   to prove the exec-permission check across matching/mismatched groups)
+   are two more concurrently live threads, so bumped again (264 -> 272) for
+   the same headroom reason as every bump above. pidfdtest (boot-time
+   spawned, real pidfd.h live demo through sysPidfdOpen/sysPidfdSend/
+   sysPidfdWait) plus the one runtime-spawned copy of /bin/killvictim it
+   reuses as its target (same proven "genuinely stuck" shape killtest.c
+   already established) are two more concurrently live threads, so bumped
+   again (272 -> 280) for the same headroom reason as every bump above.
+   mmaptest (boot-time spawned, real mmap(2)/munmap(2) demand-paging live
+   demo through sysMmap/sysMunmap -- anonymous demand-zero, file-backed
+   read-through, and a real SIGSEGV proven against a PROT_READ-only
+   mapping) plus the one runtime-spawned copy of /bin/mmapprotvictim it
+   uses to prove that last case are two more concurrently live threads, so
+   bumped again (280 -> 288) for the same headroom reason as every bump
+   above. */
+#define maxThreads 288
 #define threadStackSize 16384
+
+/* Virtual-runtime charge for one timer tick's worth of execution at
+   schedDefaultWeight; scaled by schedDefaultWeight/weight for other
+   weights (see threadSetPriority). Purely an internal unit -- only ever
+   compared against other vruntime values, never against wall-clock time. */
+#define schedTickCharge 1000000ull
 
 static Thread threads[maxThreads];
 static uint32 threadTotal;
 static uint32 currentIndex;
 static bool schedulerActive;
+
+/* allocSlot's own round-robin cursor -- see that function's doc comment
+   for why this exists at all, not just "the lowest free index" the way
+   threadTotal's own high-water-mark growth already reads left to right. */
+static uint32 nextSlotHint = 1;
+
+/* Thread.generation's own monotonic source (see that field's doc comment,
+   sched.h) -- never 0 (0 is reserved to mean "this slot is currently
+   unoccupied", the same convention pipe.c's nextPipeIncarnation already
+   uses for the identical reason), never reused, incremented once per
+   threadCreate/threadCreateUser regardless of which slot the new thread
+   lands in. */
+static uint32 nextThreadGeneration = 1;
+
+/* Bounded copy into a Thread's own name buffer (see threadNameMax /
+   sched.h) -- never aliases the caller's storage, since threadCreateUser
+   is called from syscall.c with a path that lives in a stack-local buffer
+   for the duration of one syscall. */
+static void copyThreadName(Thread* thread, const char* name)
+{
+    uint64 len = strlen(name);
+    if (len >= threadNameMax)
+        len = threadNameMax - 1;
+    memcpy(thread->name, name, len);
+    thread->name[len] = 0;
+}
+
+void threadSetName(uint32 id, const char* name)
+{
+    if (id >= threadTotal)
+        return;
+    copyThreadName(&threads[id], name);
+}
 
 void schedInit(void)
 {
@@ -202,20 +304,188 @@ void schedInit(void)
     currentIndex = 0;
 
     threads[0].id = 0;
-    threads[0].name = "idle";
+    threads[0].parentId = 0;
+    /* Reserved, permanently: idle is never reaped/recreated, and pid 0 is
+       already rejected as a pidfd/kill/wait target everywhere else, so it
+       never needs a real incarnation of its own (see Thread.generation's
+       own doc comment). */
+    threads[0].generation = 0;
+    threads[0].pgid = 0;
+    threads[0].uid = 0;
+    threads[0].gid = 0;
+    threads[0].cwd[0] = '/';
+    threads[0].cwd[1] = 0;
+    threads[0].envCount = 0;
+    copyThreadName(&threads[0], "idle");
     threads[0].state = threadRunning;
     threads[0].rsp = 0;
     threads[0].stackBase = 0;
     threads[0].kernelStackTop = 0;
     threads[0].sleepUntil = 0;
     threads[0].brk = 0;
+    threads[0].vruntime = 0;
+    threads[0].exitCode = 0;
+    threads[0].weight = schedDefaultWeight;
+    threads[0].everRan = true;
+    threads[0].waitChannel = nullptr;
     vfsFdInit(threads[0].fds);
+}
+
+/* Finds a slot for a new thread: a threadUnused slot left by a prior
+   threadReap, or (if none is free) grows the high-water mark by one as
+   long as there is room under maxThreads. Returns threadInvalidId,
+   touching nothing, if the table is completely full -- the caller must not
+   write into threads[] in that case (this is the bounds-check the original
+   version of this table was missing: threadTotal used to grow unconditionally
+   on every create, silently writing past the array once 16 threads existed).
+   Scans round-robin from nextSlotHint (wrapping through 1..threadTotal-1)
+   rather than always restarting from the lowest index: a real,
+   reproducibly observed bug this fala's own gate caught fresh on BOTH
+   killtest.c (a pre-existing, years-old check) and the new nicetest.c --
+   "kill/nice a pid this process itself just userWait()-reaped must fail"
+   occasionally failed for real, because some COMPLETELY UNRELATED thread
+   elsewhere in the system (in the reproduced case, jobctlfg being loaded
+   by the shell) called threadCreate/threadCreateUser in the tiny window
+   between the reap and the recheck and got handed that exact just-freed
+   LOW index straight back, since the old scan always tried index 1 first.
+   That is table pressure racing against a single process's own two
+   syscalls, not a scheduling-timing flake -- ci-test.sh's needle for it
+   (killtest: kill-ok) had simply never been unlucky enough to hit it
+   before this fala's elevated host load made the race common enough to
+   reproduce in a handful of runs. A round-robin cursor does not make the
+   race impossible (a table sustained at 100% occupancy for a full sweep
+   could still wrap back around to a freshly-freed slot), but with this
+   project's real, generous headroom margins (maxThreads far above actual
+   concurrent occupancy at any point in the historical record, sched.h's
+   own bump history) it means dozens-to-hundreds of OTHER allocations have
+   to happen before the cursor can return to any one just-freed slot --
+   the same practical-elimination-via-headroom shape every other table-
+   pressure fix in this file's history already has, not a new kind of
+   guarantee. A real generation/incarnation counter on pid itself (the
+   pipeIncarnation/sfsGeneration shape vfs.c/sfs.c already use for pipes
+   and the on-disk filesystem) would close it completely regardless of
+   occupancy, but reshaping what a "pid" IS everywhere kill/wait/sigSend/
+   setpgid/nice already accept it as a raw table index is the large,
+   deferred, cross-cutting change this project's own history has flagged
+   many times over (killtest.c's own doc comment, frostbyte-budowa.md) --
+   out of scope for this fix.
+
+   That generation counter now exists (Thread.generation, sched.h; this
+   file's own nextThreadGeneration below) -- but deliberately NOT wired
+   into kill/wait/sigSend/setpgid/nice's raw pid argument, matching real
+   Linux's own resolution of this exact, well-known race: pidfd_open(2)
+   added a SEPARATE, opt-in handle type rather than ever making a plain
+   pid argument itself generation-checked. See pidfd.h for the additive
+   primitive built on Thread.generation, and schedTest.c's pidfd tests for
+   a deterministic (create/discard/recreate, no live scheduling involved)
+   reproduction of exactly the stale-handle-hits-an-unrelated-live-thread
+   scenario killtest.c's own comment warns about but never guards against. */
+static uint32 allocSlot(void)
+{
+    if (threadTotal > 1) {
+        uint32 start = (nextSlotHint >= 1 && nextSlotHint < threadTotal) ? nextSlotHint : 1;
+        uint32 i = start;
+        do {
+            if (threads[i].state == threadUnused) {
+                nextSlotHint = i + 1;
+                return i;
+            }
+            i = (i + 1 < threadTotal) ? i + 1 : 1;
+        } while (i != start);
+    }
+    if (threadTotal < maxThreads) {
+        uint32 slot = threadTotal++;
+        nextSlotHint = slot + 1;
+        return slot;
+    }
+    return threadInvalidId;
+}
+
+/* Thread.pgid's own creation-time default (see that field's doc comment,
+   sched.h): a thread created while the idle thread (id 0) is "current" can
+   only be one of kmain.c's boot-time calls (parentId's own comment already
+   establishes idle never issues a syscall, so it can never be "current"
+   again once real processes exist) -- exactly like a real init spawning
+   each service into its own job, it becomes its own new group leader.
+   Anything else is a genuine runtime child (syscall.c's doSpawn) of a
+   currently-Running parent, and inherits that parent's pgid, matching real
+   fork()'s own default before any setpgid ever runs. */
+static uint32 initialPgid(uint32 newId)
+{
+    if (currentIndex == 0)
+        return newId;
+    return threads[currentIndex].pgid;
+}
+
+/* Thread.uid's own creation-time default, same "is the idle thread
+   currently running" test as initialPgid immediately above but with
+   pgid's own conclusion inverted: a boot-time thread starts as uid 0
+   ("root"), like a real init process running as the superuser, rather than
+   becoming its own new anything; a genuine runtime child instead INHERITS
+   its parent's uid outright (not derived from newId at all), matching real
+   fork()'s own default before any setuid ever runs -- the same "copy the
+   parent's value" shape initialCwd/initialEnv below already use for their
+   own fields, just a scalar instead of a buffer so it returns a value
+   like initialPgid does. */
+static uint32 initialUid(uint32 newId)
+{
+    (void)newId;
+    if (currentIndex == 0)
+        return 0;
+    return threads[currentIndex].uid;
+}
+
+/* Thread.gid's own creation-time default, byte-for-byte the same shape as
+   initialUid immediately above: a boot-time thread starts at gid 0, a
+   genuine runtime child INHERITS its parent's gid outright. */
+static uint32 initialGid(uint32 newId)
+{
+    (void)newId;
+    if (currentIndex == 0)
+        return 0;
+    return threads[currentIndex].gid;
+}
+
+/* Thread.cwd's own creation-time default, mirroring initialPgid's own
+   reasoning immediately above exactly (same "is the idle thread currently
+   running" test, same conclusion for the same reason): a boot-time thread
+   starts at the filesystem root, like a real init process; a genuine
+   runtime child instead gets a byte-for-byte COPY of its parent's cwd,
+   matching real fork()'s own copy-not-share semantics -- writes into
+   threads[newId].cwd directly (rather than returning a value the way
+   initialPgid does) since a path is a buffer, not a scalar. */
+static void initialCwd(uint32 newId)
+{
+    if (currentIndex == 0) {
+        threads[newId].cwd[0] = '/';
+        threads[newId].cwd[1] = 0;
+        return;
+    }
+    memcpy(threads[newId].cwd, threads[currentIndex].cwd, fsPathMax);
+}
+
+/* Thread.env's own creation-time default, mirroring initialCwd's own
+   reasoning immediately above exactly (same "is the idle thread currently
+   running" test, same conclusion for the same reason): a boot-time thread
+   starts with an empty table, like a real init process before anything
+   ever calls setenv(); a genuine runtime child instead gets a byte-for-byte
+   COPY of its parent's whole table (both the entries and envCount), never
+   a shared pointer. */
+static void initialEnv(uint32 newId)
+{
+    if (currentIndex == 0) {
+        threads[newId].envCount = 0;
+        return;
+    }
+    memcpy(threads[newId].env, threads[currentIndex].env, sizeof(threads[newId].env));
+    threads[newId].envCount = threads[currentIndex].envCount;
 }
 
 uint32 threadCreate(const char* name, ThreadEntry entry)
 {
-    uint32 slot = threadTotal;
-    threadTotal++;
+    uint32 slot = allocSlot();
+    if (slot == threadInvalidId)
+        return threadInvalidId;
 
     uint64 stackBase = (uint64)kmalloc(threadStackSize);
     uint64 stackTop = (stackBase + threadStackSize) & ~15ull;
@@ -229,22 +499,40 @@ uint32 threadCreate(const char* name, ThreadEntry entry)
     frame->ss = kernelDataSelector;
 
     threads[slot].id = slot;
-    threads[slot].name = name;
+    threads[slot].generation = nextThreadGeneration++;
+    threads[slot].parentId = currentIndex;
+    threads[slot].pgid = initialPgid(slot);
+    threads[slot].uid = initialUid(slot);
+    threads[slot].gid = initialGid(slot);
+    initialCwd(slot);
+    initialEnv(slot);
+    copyThreadName(&threads[slot], name);
     threads[slot].state = threadRunnable;
     threads[slot].stackBase = stackBase;
     threads[slot].kernelStackTop = stackTop;
     threads[slot].rsp = (uint64)frame;
     threads[slot].sleepUntil = 0;
+    threads[slot].alarmAt = 0;
+    threads[slot].pollActive = false;
+    threads[slot].pollDeadline = 0;
     threads[slot].brk = 0;
+    threads[slot].vruntime = 0;
+    threads[slot].exitCode = 0;
+    threads[slot].weight = schedDefaultWeight;
+    threads[slot].everRan = false;
+    threads[slot].waitChannel = nullptr;
+    threads[slot].userSlotBase = 0;
     vfsFdInit(threads[slot].fds);
+    sigResetState(&threads[slot]);
 
     return slot;
 }
 
 uint32 threadCreateUser(const char* name, uint64 entry, uint64 userStackTop)
 {
-    uint32 slot = threadTotal;
-    threadTotal++;
+    uint32 slot = allocSlot();
+    if (slot == threadInvalidId)
+        return threadInvalidId;
 
     uint64 stackBase = (uint64)kmalloc(threadStackSize);
     uint64 kernelStackTop = (stackBase + threadStackSize) & ~15ull;
@@ -258,43 +546,106 @@ uint32 threadCreateUser(const char* name, uint64 entry, uint64 userStackTop)
     frame->ss = userDataSelector | 3;
 
     threads[slot].id = slot;
-    threads[slot].name = name;
+    threads[slot].generation = nextThreadGeneration++;
+    threads[slot].parentId = currentIndex;
+    threads[slot].pgid = initialPgid(slot);
+    threads[slot].uid = initialUid(slot);
+    threads[slot].gid = initialGid(slot);
+    initialCwd(slot);
+    initialEnv(slot);
+    copyThreadName(&threads[slot], name);
     threads[slot].state = threadRunnable;
     threads[slot].stackBase = stackBase;
     threads[slot].kernelStackTop = kernelStackTop;
     threads[slot].rsp = (uint64)frame;
     threads[slot].sleepUntil = 0;
+    threads[slot].alarmAt = 0;
+    threads[slot].pollActive = false;
+    threads[slot].pollDeadline = 0;
     threads[slot].brk = 0;
+    threads[slot].vruntime = 0;
+    threads[slot].exitCode = 0;
+    threads[slot].weight = schedDefaultWeight;
+    threads[slot].everRan = false;
+    threads[slot].waitChannel = nullptr;
+    threads[slot].userSlotBase = elfSlotBase(entry);
     vfsFdInit(threads[slot].fds);
+    sigResetState(&threads[slot]);
 
     return slot;
 }
 
+/* CFS-lite selection: every reschedule rebuilds a min-vruntime priority
+   queue (prioq.h, backed by the intrusive rbt) from every currently
+   Runnable thread and picks the minimum. The queue is deliberately
+   ephemeral (built fresh each call, discarded after one pop) rather than a
+   run-queue whose membership persists across calls -- a thread can become
+   Runnable from code paths other than schedule() itself (schedWakeChannel,
+   called from pipe.c on the producer/consumer side of a wait-queue), and
+   rebuilding from the authoritative `state` field every time means there is
+   never a second copy of "who is runnable" to fall out of sync. */
 uint64 schedule(uint64 currentRsp)
 {
     if (!schedulerActive)
         return currentRsp;
 
-    threads[currentIndex].rsp = currentRsp;
-    if (threads[currentIndex].state == threadRunning)
-        threads[currentIndex].state = threadRunnable;
+    Thread* current = &threads[currentIndex];
+    current->rsp = currentRsp;
+    if (current->state == threadRunning) {
+        current->vruntime += schedTickCharge * schedDefaultWeight / current->weight;
+        current->state = threadRunnable;
+    }
 
     uint64 now = pitTicks();
     for (uint32 i = 0; i < threadTotal; i++)
         if (threads[i].state == threadSleeping && now >= threads[i].sleepUntil)
             threads[i].state = threadRunnable;
 
-    uint32 next = 0;
-    for (uint32 step = 1; step <= threadTotal; step++) {
-        uint32 candidate = (currentIndex + step) % threadTotal;
-        if (threads[candidate].state == threadRunnable) {
-            next = candidate;
-            break;
+    /* sysPoll's own timeout, forced the exact same way sleepUntil's expiry
+       is above: a thread parked on schedPollChannel because none of its
+       requested fds were ready yet still needs to wake up on its own even
+       if NONE of them ever becomes ready (pollDeadline == 0 means "wait
+       forever", i.e. a real timeout of -1, and is deliberately never
+       forced here). The retried sysPoll call (syscall.c) re-checks every
+       fd from scratch on wake regardless of why it woke, so forcing
+       Runnable here without clearing waitChannel first (same as the
+       sleepUntil scan just above) is enough -- there is no separate
+       "why did I wake" state to reconcile. */
+    for (uint32 i = 0; i < threadTotal; i++)
+        if (threads[i].state == threadBlocked && threads[i].pollActive &&
+            threads[i].pollDeadline != 0 && now >= threads[i].pollDeadline)
+            threads[i].state = threadRunnable;
+
+    /* Real alarm(2) delivery: a deadline set by threadSetAlarm fires here,
+       once per timer tick, regardless of what state its owning thread is
+       currently in (Running, Sleeping, Blocked -- a real alarm keeps
+       ticking no matter what the process is doing). Cleared BEFORE
+       raising, not after, so one expiry fires sigAlrm exactly once, not
+       once per tick until something else clears it; sigRaiseInfo (signal.h)
+       already refuses a Dead/Unused target harmlessly, so a thread that
+       exited with an alarm still pending needs no special case here.
+       siCodeKernel/0/0: a real SIGALRM has no sending process and no exit
+       status of its own to report (real Unix's own SIGALRM si_code is
+       SI_KERNEL/SI_TIMER for exactly this reason -- it is the kernel's
+       timer, not another process, that raised it). */
+    for (uint32 i = 0; i < threadTotal; i++)
+        if (threads[i].alarmAt != 0 && now >= threads[i].alarmAt) {
+            threads[i].alarmAt = 0;
+            sigRaiseInfo(threads[i].id, sigAlrm, siCodeKernel, 0, 0);
         }
-    }
+
+    PrioQueue ready;
+    prioqInit(&ready);
+    for (uint32 i = 0; i < threadTotal; i++)
+        if (threads[i].state == threadRunnable)
+            prioqInsert(&ready, &threads[i].schedNode, threads[i].vruntime, threads[i].id);
+
+    PrioQNode* winner = prioqPopMin(&ready);
+    uint32 next = winner ? winner->id : currentIndex;
 
     currentIndex = next;
     threads[next].state = threadRunning;
+    threads[next].everRan = true;
     tssSetRsp0(threads[next].kernelStackTop);
     return threads[next].rsp;
 }
@@ -310,6 +661,7 @@ void schedStart(void)
 void threadExit(uint64 code)
 {
     Thread* thread = &threads[currentIndex];
+    thread->exitCode = code;
     thread->state = threadDead;
     kprintf("[user] pid=%u '%s' exited with code %lu\n", thread->id, thread->name, code);
 }
