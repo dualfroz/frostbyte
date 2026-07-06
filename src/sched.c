@@ -837,6 +837,292 @@ const char* currentThreadGetEnv(const char* name)
             return value + 1;
         }
     }
+    return nullptr;
+}
+
+bool currentThreadSetEnv(const char* name, const char* value)
+{
+    Thread* self = &threads[currentIndex];
+    uint64 nameLen = strlen(name);
+    uint64 valueLen = strlen(value);
+    if (nameLen + 1 + valueLen + 1 > envEntryMax)
+        return false;
+
+    int slot = -1;
+    for (int i = 0; i < self->envCount; i++) {
+        if (envNameMatches(self->env[i], name)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (self->envCount >= envMaxVars)
+            return false;
+        slot = self->envCount++;
+    }
+
+    memcpy(self->env[slot], name, nameLen);
+    self->env[slot][nameLen] = '=';
+    memcpy(self->env[slot] + nameLen + 1, value, valueLen);
+    self->env[slot][nameLen + 1 + valueLen] = 0;
+    return true;
+}
+
+bool currentThreadUnsetEnv(const char* name)
+{
+    Thread* self = &threads[currentIndex];
+    int slot = -1;
+    for (int i = 0; i < self->envCount; i++) {
+        if (envNameMatches(self->env[i], name)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        return false;
+
+    int last = self->envCount - 1;
+    if (slot != last)
+        memmove(self->env[slot], self->env[slot + 1], (uint64)(last - slot) * envEntryMax);
+    self->envCount--;
+    return true;
+}
+
+int currentThreadEnvCount(void)
+{
+    return threads[currentIndex].envCount;
+}
+
+const char* currentThreadEnvEntry(int index)
+{
+    if (index < 0 || index >= threads[currentIndex].envCount)
+        return nullptr;
+    return threads[currentIndex].env[index];
+}
+
+bool threadStop(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+
+    ThreadState state = threads[id].state;
+    if (state == threadDead || state == threadUnused)
+        return false;
+    if (state == threadStopped) {
+        /* Idempotent, matching real kill(pid, SIGSTOP) sent to an already-
+           stopped process: the state transition already happened, so there
+           is no new event for the parent's SIGCHLD to report -- raising
+           again here would be a second notification for a single stop. */
+        return true;
+    }
+
+    threads[id].state = threadStopped;
+    kprintf("[sched] pid=%u '%s' stopped\n", id, threads[id].name);
+
+    /* Real job-control SIGCHLD-on-stop, the same asynchronous notification
+       threadExit/threadKill above already raise on death (Thread.parentId,
+       signal.h's sigRaiseInfo) -- a shell watching a background job's
+       parentId finds out the instant it stops, not only when it eventually
+       dies or exits. Only reached on the actual ...->Stopped transition
+       above, never on the already-Stopped no-op return just above.
+       siCodeChldStopped/id/sigStop: real Unix's WIFSTOPPED(status) +
+       WSTOPSIG(status) would report whichever signal actually caused the
+       stop -- this function is called from exactly two places (signal.c's
+       sigRaise sigStop branch, a real SIGSTOP; isr.c's sigTstp-default-
+       disposition branch, a real SIGTSTP) and does not itself know which
+       one, so si_status always reports sigStop here regardless. A known,
+       documented imprecision for the SIGTSTP path (which also has no live
+       ring-3 demo of its own yet -- see signal.h's file comment) -- not a
+       fabricated distinction either path never had. */
+    sigRaiseInfo(threads[id].parentId, sigChld, siCodeChldStopped, (int)id, sigStop);
+    return true;
+}
+
+bool threadContinue(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+    if (threads[id].state != threadStopped)
+        return false;
+
+    threads[id].state = threadRunnable;
+    kprintf("[sched] pid=%u '%s' continued\n", id, threads[id].name);
+
+    /* Same job-control SIGCHLD contract as threadStop above, mirrored for
+       SIGCONT: real job-control shells rely on this to notice a
+       backgrounded job resumed without polling its state. Only reached
+       past the "was it actually Stopped" guard above, so this never fires
+       for a SIGCONT sent to a target that was never stopped in the first
+       place, matching real Unix (nothing to report). siCodeChldContinued/
+       id/sigCont: real Unix's WIFCONTINUED(status), si_status unused for
+       this one (POSIX defines none for CLD_CONTINUED either) -- sigCont
+       here is honest, not a placeholder, unlike threadStop's own sigStop
+       above: threadContinue really is only ever reached via a genuine
+       SIGCONT (signal.c's sigRaise sigCont branch is its only caller with
+       a live path to a Stopped target). */
+    sigRaiseInfo(threads[id].parentId, sigChld, siCodeChldContinued, (int)id, sigCont);
+    return true;
+}
+
+bool threadWakeForSignal(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+
+    ThreadState state = threads[id].state;
+    if (state != threadSleeping && state != threadBlocked)
+        return false;
+
+    threads[id].state = threadRunnable;
+    kprintf("[sig]  pid=%u '%s' woken early for a signal\n", id, threads[id].name);
+    return true;
+}
+
+uint32 threadCapacity(void)
+{
+    return maxThreads;
+}
+
+/* Gives a dead/discarded user thread's whole elfSlotSize slot back to the
+   pmm. Verified, not just invoked blindly: a byte inside the slot's stack
+   region (always mapped for any user thread, whatever its image looks
+   like -- see loadImageByPath/spawnUser) is checked present BEFORE the
+   unmap (proving there was really something to reclaim, not a no-op on an
+   already-empty slot) and absent AFTER (proving the unmap actually took
+   the frame back), logged so the boot gate can hold the wiring itself
+   accountable rather than trusting that calling pagingUnmapUserRange was
+   enough. Kernel threads (userSlotBase 0) are silently skipped. */
+static void reclaimUserSlot(uint32 id, const Thread* thread)
+{
+    if (thread->userSlotBase == 0)
+        return;
+
+    uint64 slotBase = thread->userSlotBase;
+    uint64 stackProbe = slotBase + elfSlotStackOffset - 1;
+    bool wasMapped = pagingResolve(stackProbe) != 0;
+
+    pagingUnmapUserRange(slotBase, elfSlotSize);
+
+    bool nowFreed = pagingResolve(stackProbe) == 0;
+    kprintf("[sched] reap pid=%u freed user slot %p (was-mapped=%s now-freed=%s) -> %s\n",
+            id, (void*)slotBase, wasMapped ? "yes" : "no", nowFreed ? "yes" : "no",
+            (wasMapped && nowFreed) ? "user-mem-reclaimed-ok" : "user-mem-reclaimed-FAIL");
+}
+
+/* Every open fd a thread still holds when it dies represents a live
+   reference into some other subsystem's own refcounted table -- fd 0's
+   console reader queue (keyboard.h, allocated unconditionally by vfsFdInit
+   regardless of whether the thread ever reads stdin, see vfs.c) and any
+   fdPipeRead/fdPipeWrite fd (pipe.h's readers/writers counts on the
+   underlying handle, from vfsPipe/vfsPipeAttach/a named fifo's vfsOpen).
+   vfsClose already decrements both correctly, but only for a LIVE thread
+   closing its OWN fd through currentThread() -- a thread that dies
+   (threadKill, or simply returns/threadExit) while still holding either
+   open skips vfsClose entirely, so without this the memset below would
+   just drop the handle on the floor.
+   For the console reader this was caught live (FALA 13): the reader table
+   is a small fixed pool (maxConsoleReaders), and schedTest.c alone creates
+   and tears down dozens of throwaway threads while proving the sched table
+   itself reuses freed slots (threadCreateExhaustsThenThreadDiscardFrees...),
+   which permanently exhausted the ENTIRELY SEPARATE console reader pool
+   before boot ever reached kmain.c's real spawnUser calls -- every
+   boot-time process's fd 0 silently went non-blocking (keyboardOpenReader
+   returning consoleReaderInvalid), so consolereader1.c/consolereader2.c's
+   userRead(0, ...) returned -1 immediately instead of blocking for the
+   synthetic keystroke.
+   The pipe/fifo case is the same shape of leak, just against pipe.c's own
+   readers/writers counters instead of a fixed pool: the OTHER end of a
+   shared pipe (a second, independent process, e.g. fifomaster.c's
+   children) would never see the true EOF/broken-pipe pipeRead/pipeWrite
+   report once every attached end on this side is gone, and would instead
+   retry "try again" forever -- exactly the resource-exhaustion shape
+   bug#2 above had, just not yet observed breaking anything live because
+   nothing today loses a pipe/fifo fd without an orderly close() first (see
+   schedTest.c's reclaimOpenFds tests, which prove the leak by fault
+   injection rather than waiting for a live symptom). */
+static void reclaimOpenFds(const Thread* thread)
+{
+    for (uint32 i = 0; i < maxOpenFiles; i++) {
+        const FileDescriptor* fd = &thread->fds[i];
+        if (fd->kind == fdConsole && fd->pipeHandle >= 0)
+            keyboardCloseReader(fd->pipeHandle);
+        else if (fd->kind == fdPipeRead)
+            pipeCloseRead(fd->pipeHandle);
+        else if (fd->kind == fdPipeWrite)
+            pipeCloseWrite(fd->pipeHandle);
+        else if (fd->kind == fdPidfd)
+            pidfdClose(fd->pipeHandle);
+    }
+}
+
+bool threadReap(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+    if (threads[id].state != threadDead)
+        return false;
+
+    reclaimUserSlot(id, &threads[id]);
+    reclaimOpenFds(&threads[id]);
+    if (threads[id].stackBase)
+        kfree((void*)threads[id].stackBase);
+    memset(&threads[id], 0, sizeof(Thread));
+    /* memset leaves state at 0, which is threadUnused -- exactly the value
+       allocSlot() scans for when looking for a slot to reuse. */
+    return true;
+}
+
+bool threadDiscard(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+    if (threads[id].state != threadRunnable || threads[id].everRan)
+        return false;
+
+    if (threads[id].userSlotBase != 0)
+        pagingUnmapUserRange(threads[id].userSlotBase, elfSlotSize);
+    reclaimOpenFds(&threads[id]);
+    if (threads[id].stackBase)
+        kfree((void*)threads[id].stackBase);
+    memset(&threads[id], 0, sizeof(Thread));
+    return true;
+}
+
+int64 threadJoin(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return -1;
+
+    for (;;) {
+        ThreadState state = threads[id].state;
+        if (state == threadUnused)
+            return -1;
+        if (state == threadDead)
+            break;
+        schedBlockCurrent(&threads[id]);
+        halt();
+    }
+
+    uint64 code = threads[id].exitCode;
+    threadReap(id);
+    return (int64)code;
+}
+
+WaitScanResult threadJoinAnyChild(uint32 parentId, uint32* outId, int64* outCode)
+{
+    bool hasChild = false;
+    for (uint32 i = 1; i < threadTotal; i++) {
+        if (threads[i].state == threadUnused || threads[i].parentId != parentId)
+            continue;
+        hasChild = true;
+        if (threads[i].state == threadDead) {
+            *outId = i;
+            *outCode = (int64)threads[i].exitCode;
+            threadReap(i);
+            return waitScanFoundDead;
+        }
+    }
+    return hasChild ? waitScanNoneDead : waitScanNoChildren;
 }
 
 void threadSleep(uint64 milliseconds)
@@ -848,9 +1134,98 @@ void threadSleep(uint64 milliseconds)
     threads[currentIndex].state = threadSleeping;
 }
 
+uint64 threadSetAlarm(uint64 seconds)
+{
+    Thread* self = &threads[currentIndex];
+    uint64 now = pitTicks();
+
+    uint64 previousRemaining = 0;
+    if (self->alarmAt != 0 && self->alarmAt > now) {
+        uint64 remainingTicks = self->alarmAt - now;
+        uint32 freq = pitFrequency();
+        /* Ceiling division: a deadline anywhere inside the current second
+           still counts as "1 second remaining", never "0" -- matching real
+           alarm()'s own contract that a not-yet-fired alarm never reports
+           0 remaining (0 is reserved for "none pending" everywhere in this
+           API, see the header comment). */
+        previousRemaining = (remainingTicks + freq - 1) / freq;
+    }
+
+    if (seconds == 0)
+        self->alarmAt = 0;
+    else
+        self->alarmAt = now + seconds * (uint64)pitFrequency();
+
+    return previousRemaining;
+}
+
+void schedBlockCurrent(const void* channel)
+{
+    threads[currentIndex].waitChannel = channel;
+    threads[currentIndex].state = threadBlocked;
+}
+
+const void* schedPollChannel(void)
+{
+    static const int pollChannelToken;
+    return (const void*)&pollChannelToken;
+}
+
+void schedWakeChannel(const void* channel)
+{
+    for (uint32 i = 0; i < threadTotal; i++) {
+        if (threads[i].state == threadBlocked && threads[i].waitChannel == channel) {
+            threads[i].waitChannel = nullptr;
+            threads[i].state = threadRunnable;
+        }
+    }
+}
+
 void threadSetBrk(uint32 id, uint64 brk)
 {
+    if (id >= maxThreads)
+        return;
     threads[id].brk = brk;
+}
+
+uint64 threadUserSlotBase(uint32 id)
+{
+    if (id >= maxThreads)
+        return 0;
+    return threads[id].userSlotBase;
+}
+
+void threadSetUserSlotBase(uint32 id, uint64 base)
+{
+    if (id >= maxThreads)
+        return;
+    threads[id].userSlotBase = base;
+}
+
+bool threadSetPriority(uint32 id, uint32 weight)
+{
+    if (id == 0 || id >= maxThreads || weight == 0)
+        return false;
+    ThreadState state = threads[id].state;
+    if (state == threadDead || state == threadUnused)
+        return false;
+
+    threads[id].weight = weight;
+    return true;
+}
+
+uint32 threadPriority(uint32 id)
+{
+    if (id >= maxThreads || threads[id].state == threadUnused)
+        return 0;
+    return threads[id].weight;
+}
+
+uint64 threadVruntime(uint32 id)
+{
+    if (id >= threadTotal)
+        return 0;
+    return threads[id].vruntime;
 }
 
 uint64 currentThreadSbrk(int64 increment)
@@ -859,7 +1234,7 @@ uint64 currentThreadSbrk(int64 increment)
     uint64 previous = thread->brk;
 
     if (increment > 0)
-        pagingMapUserRange(previous, (uint64)increment);
+        pagingMapUserRangeFlags(previous, (uint64)increment, pageNoExecute);
 
     thread->brk = previous + (uint64)increment;
     return previous;
