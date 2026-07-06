@@ -664,6 +664,179 @@ void threadExit(uint64 code)
     thread->exitCode = code;
     thread->state = threadDead;
     kprintf("[user] pid=%u '%s' exited with code %lu\n", thread->id, thread->name, code);
+
+    /* Real, asynchronous SIGCHLD (signal.h/signal.c) against whoever
+       spawned this thread (Thread.parentId, sched.h) -- see threadExit's
+       own doc comment for why this matters beyond threadJoin/sysWait's
+       already-existing synchronous reap. sigRaiseInfo itself is what makes
+       this safe against parentId 0 (idle) or an already-gone parent.
+       siCodeChldExited/this thread's own id/code: real Unix's own
+       WIFEXITED(status) + WEXITSTATUS(status), exposed directly as
+       si_pid/si_status instead of a packed word a caller must decode. */
+    sigRaiseInfo(thread->parentId, sigChld, siCodeChldExited, (int)thread->id, (int)code);
+
+    /* Wake whichever thread (if any) is parked in threadJoin(thread->id) --
+       the channel is this slot's own address, matching threadJoin's
+       schedBlockCurrent(&threads[id]) below. Harmless no-op if nobody is
+       joining this thread. */
+    schedWakeChannel(thread);
+
+    /* Also wake whichever thread (if any) is parked waiting for ANY child
+       of thread->parentId (sysWait's waitAnyPid path, syscall.c, via
+       schedBlockCurrent(currentThread())) -- see threadExit's own doc
+       comment in sched.h. Channel is the PARENT's own slot address, not
+       this dying thread's, so it is naturally distinct from the wake above
+       and a harmless no-op if the parent never called userWaitAny. */
+    schedWakeChannel(&threads[thread->parentId]);
+}
+
+bool threadKill(uint32 id)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+
+    ThreadState state = threads[id].state;
+    if (state != threadRunnable && state != threadSleeping &&
+        state != threadBlocked && state != threadStopped)
+        return false;
+
+    threads[id].exitCode = threadKilledExitCode;
+    threads[id].state = threadDead;
+    kprintf("[sched] pid=%u '%s' killed\n", id, threads[id].name);
+
+    /* Same sigChld-to-parent contract as threadExit -- a killed child is
+       still a dead child as far as SIGCHLD is concerned (see threadKill's
+       own doc comment). siCodeChldKilled/id/threadKilledExitCode: real
+       Unix's own WIFSIGNALED(status) + WTERMSIG(status) would report the
+       actual killing signal number; this kernel's threadKill is not tied
+       to any one specific signal (SIGKILL's sigRaiseInfo delegates
+       straight here without ever reaching sigPendingInfo itself, and
+       userKill calls this directly with no signal at all) -- si_status
+       reports threadKilledExitCode instead, the exact same "killed" value
+       userWait already surfaces elsewhere in this kernel, not a new
+       fabricated number. */
+    sigRaiseInfo(threads[id].parentId, sigChld, siCodeChldKilled, (int)id, (int)threadKilledExitCode);
+
+    /* Same wake-the-joiner contract as threadExit -- a thread already
+       parked in threadJoin(id) (or the retry-syscall path in sysWait,
+       syscall.c) must not wait for its victim to "finish" some
+       in-progress work first, since a killed thread never gets to. */
+    schedWakeChannel(&threads[id]);
+
+    /* Same any-child wake as threadExit -- see threadKill's own doc
+       comment in sched.h. */
+    schedWakeChannel(&threads[threads[id].parentId]);
+    return true;
+}
+
+uint32 threadPgid(uint32 id)
+{
+    if (id >= maxThreads || threads[id].state == threadUnused)
+        return threadInvalidId;
+    return threads[id].pgid;
+}
+
+bool threadSetPgid(uint32 id, uint32 pgid)
+{
+    if (id == 0 || id >= maxThreads)
+        return false;
+    ThreadState state = threads[id].state;
+    if (state == threadDead || state == threadUnused)
+        return false;
+
+    threads[id].pgid = pgid;
+    return true;
+}
+
+bool threadKillGroup(uint32 pgid)
+{
+    bool anyKilled = false;
+    for (uint32 id = 1; id < threadTotal; id++) {
+        if (threads[id].state == threadDead || threads[id].state == threadUnused)
+            continue;
+        if (threads[id].pgid != pgid)
+            continue;
+        if (threadKill(id))
+            anyKilled = true;
+    }
+    return anyKilled;
+}
+
+const char* currentThreadCwd(void)
+{
+    return threads[currentIndex].cwd;
+}
+
+bool currentThreadSetCwd(const char* path)
+{
+    uint64 len = strlen(path);
+    if (len >= fsPathMax)
+        return false;
+    memcpy(threads[currentIndex].cwd, path, len);
+    threads[currentIndex].cwd[len] = 0;
+    return true;
+}
+
+uint32 currentThreadUid(void)
+{
+    return threads[currentIndex].uid;
+}
+
+bool currentThreadSetUid(uint32 newUid)
+{
+    uint32 uid = threads[currentIndex].uid;
+    if (uid != 0 && newUid != uid)
+        return false;
+    threads[currentIndex].uid = newUid;
+    return true;
+}
+
+uint32 currentThreadGid(void)
+{
+    return threads[currentIndex].gid;
+}
+
+bool currentThreadSetGid(uint32 newGid)
+{
+    /* Privilege gate is this thread's own UID (root, CAP_SETGID-style), not
+       its current GID -- see sched.h's own doc comment for why that
+       mirrors real setgid(2) rather than currentThreadSetUid's shape. */
+    if (threads[currentIndex].uid != 0) {
+        uint32 gid = threads[currentIndex].gid;
+        if (newGid != gid)
+            return false;
+    }
+    threads[currentIndex].gid = newGid;
+    return true;
+}
+
+/* True if `entry` (a stored "NAME=VALUE" slot) names the same variable as
+   `name` -- i.e. `entry` starts with `name` followed immediately by '='.
+   Comparing this way (rather than strcmp against a rebuilt "NAME=" prefix)
+   needs no scratch buffer and stops at the first mismatching byte, same
+   spirit as string.h's own strncmp. */
+static bool envNameMatches(const char* entry, const char* name)
+{
+    while (*name) {
+        if (*entry != *name)
+            return false;
+        entry++;
+        name++;
+    }
+    return *entry == '=';
+}
+
+const char* currentThreadGetEnv(const char* name)
+{
+    Thread* self = &threads[currentIndex];
+    for (int i = 0; i < self->envCount; i++) {
+        if (envNameMatches(self->env[i], name)) {
+            const char* value = self->env[i];
+            while (*value != '=')
+                value++;
+            return value + 1;
+        }
+    }
 }
 
 void threadSleep(uint64 milliseconds)
