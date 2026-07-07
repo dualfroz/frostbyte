@@ -954,3 +954,473 @@ bool sfsFormat(void)
     memset(inodeBitmap, 0, (uint64)nsb.inodeBitmapBlocks * sfsBlockSize);
     memset(blockBitmap, 0, (uint64)nsb.blockBitmapBlocks * sfsBlockSize);
 
+    sb = nsb;
+    isMounted = true;
+
+    uint8 zeroBlk[sfsBlockSize];
+    memset(zeroBlk, 0, sizeof(zeroBlk));
+    for (uint32 i = 0; i < sb.inodeTableBlocks; i++)
+        blockWrite(sb.inodeTableStart + i, zeroBlk);
+
+    bitSet(inodeBitmap, 0);
+    bitSet(inodeBitmap, sfsRootInode);
+
+    SfsInode rootInode;
+    memset(&rootInode, 0, sizeof(rootInode));
+    rootInode.type = sfsTypeDir;
+    rootInode.linkCount = 1;
+    rootInode.mtime = rootInode.ctime = (uint32)rtcNow();
+    rootInode.mode = fsModeDefaultDir;
+    rootInode.uid = currentThreadUid();
+    rootInode.gid = currentThreadGid();
+    writeInodeRaw(sfsRootInode, &rootInode);
+
+    flushInodeBitmap();
+    flushBlockBitmap();
+    flushSuperblock();
+    return true;
+}
+
+bool sfsMount(void)
+{
+    if (!ataPresent())
+        return false;
+
+    uint8 buf[sfsBlockSize];
+    if (!ataReadSectors(sfsBaseLba, 1, buf))
+        return false;
+
+    SfsSuperblock onDisk;
+    memcpy(&onDisk, buf, sizeof(onDisk));
+    if (onDisk.magic != sfsMagic)
+        return sfsFormat();
+
+    sb = onDisk;
+
+    if (inodeBitmap) {
+        kfree(inodeBitmap);
+        inodeBitmap = nullptr;
+    }
+    if (blockBitmap) {
+        kfree(blockBitmap);
+        blockBitmap = nullptr;
+    }
+
+    inodeBitmap = (uint8*)kmalloc((uint64)sb.inodeBitmapBlocks * sfsBlockSize);
+    blockBitmap = (uint8*)kmalloc((uint64)sb.blockBitmapBlocks * sfsBlockSize);
+    if (!inodeBitmap || !blockBitmap)
+        return false;
+
+    for (uint32 i = 0; i < sb.inodeBitmapBlocks; i++)
+        if (!blockRead(sb.inodeBitmapStart + i, inodeBitmap + (uint64)i * sfsBlockSize))
+            return false;
+    for (uint32 i = 0; i < sb.blockBitmapBlocks; i++)
+        if (!blockRead(sb.blockBitmapStart + i, blockBitmap + (uint64)i * sfsBlockSize))
+            return false;
+
+    isMounted = true;
+    return true;
+}
+
+void sfsUnmount(void)
+{
+    if (!isMounted)
+        return;
+    flushInodeBitmap();
+    flushBlockBitmap();
+    flushSuperblock();
+    if (inodeBitmap) {
+        kfree(inodeBitmap);
+        inodeBitmap = nullptr;
+    }
+    if (blockBitmap) {
+        kfree(blockBitmap);
+        blockBitmap = nullptr;
+    }
+    isMounted = false;
+}
+
+bool sfsMounted(void)
+{
+    return isMounted;
+}
+
+uint64 sfsCapacityBytes(void)
+{
+    if (!isMounted)
+        return 0;
+    return (uint64)(sb.totalBlocks - sb.dataStart) * sfsBlockSize;
+}
+
+uint64 sfsFreeDataBlocks(void)
+{
+    if (!isMounted)
+        return 0;
+    uint32 dataBlockCount = sb.totalBlocks - sb.dataStart;
+    uint64 free = 0;
+    for (uint32 i = 0; i < dataBlockCount; i++)
+        if (!bitTest(blockBitmap, i))
+            free++;
+    return free;
+}
+
+int32 sfsLookup(const char* path)
+{
+    return lookupFrom(path, true, 0);
+}
+
+int32 sfsLookupNoFollow(const char* path)
+{
+    return lookupFrom(path, false, 0);
+}
+
+int32 sfsCreateFile(const char* path)
+{
+    return createNode(path, sfsTypeFile);
+}
+
+int32 sfsCreateDir(const char* path)
+{
+    return createNode(path, sfsTypeDir);
+}
+
+int32 sfsCreateFifo(const char* path)
+{
+    return createNode(path, sfsTypeFifo);
+}
+
+uint64 sfsGeneration(void)
+{
+    return formatGeneration;
+}
+
+int32 sfsCreateSymlink(const char* path, const char* target)
+{
+    if (!isMounted || !target)
+        return -1;
+    uint64 targetLen = strlen(target);
+    if (targetLen == 0 || targetLen > sfsSymlinkTargetMax)
+        return -1;
+
+    int32 newInode = createNode(path, sfsTypeSymlink);
+    if (newInode < 0)
+        return -1;
+
+    if (sfsWriteAt(newInode, 0, target, targetLen) != (int64)targetLen) {
+        char parentBuf[256];
+        char leaf[sfsNameMax];
+        if (splitPath(path, parentBuf, sizeof(parentBuf), leaf, sizeof(leaf))) {
+            int32 parentInode = sfsLookup(parentBuf);
+            if (parentInode >= 0)
+                dirRemove(parentInode, leaf, strlen(leaf));
+        }
+        freeInodeNum(newInode);
+        return -1;
+    }
+    return newInode;
+}
+
+bool sfsReadlink(int32 inodeNum, char* buf, uint64 cap)
+{
+    if (!isMounted || inodeNum <= 0)
+        return false;
+    return readSymlinkTarget(inodeNum, buf, cap);
+}
+
+int32 sfsLink(const char* existingPath, const char* newPath)
+{
+    if (!isMounted)
+        return -1;
+
+    int32 target = sfsLookup(existingPath);
+    if (target < 0)
+        return -1;
+
+    SfsInode inode;
+    if (!readInode(target, &inode))
+        return -1;
+    if (inode.type == sfsTypeDir)
+        return -1;
+
+    char parentBuf[256];
+    char leaf[sfsNameMax];
+    if (!splitPath(newPath, parentBuf, sizeof(parentBuf), leaf, sizeof(leaf)))
+        return -1;
+
+    int32 parentInode = sfsLookup(parentBuf);
+    if (parentInode < 0 || sfsTypeOf(parentInode) != sfsTypeDir)
+        return -1;
+    /* Same parent-directory write check as createNode/sfsRemove above --
+       adding a new hardlink NAME needs write permission on the PARENT of
+       the new name, not on the existing target being linked to. */
+    if (!vfsPermitted(sfsModeOf(parentInode), sfsUidOf(parentInode), sfsGidOf(parentInode),
+                       currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+        return -1;
+    if (dirFind(parentInode, leaf, strlen(leaf)) >= 0)
+        return -1;
+
+    inode.linkCount++;
+    inode.ctime = (uint32)rtcNow();
+    if (!writeInodeRaw(target, &inode))
+        return -1;
+
+    if (!dirAdd(parentInode, leaf, strlen(leaf), target, inode.type)) {
+        inode.linkCount--;
+        writeInodeRaw(target, &inode);
+        return -1;
+    }
+    return target;
+}
+
+uint32 sfsLinkCountOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.linkCount;
+}
+
+bool sfsRemove(const char* path)
+{
+    if (!isMounted)
+        return false;
+
+    char parentBuf[256];
+    char leaf[sfsNameMax];
+    if (!splitPath(path, parentBuf, sizeof(parentBuf), leaf, sizeof(leaf)))
+        return false;
+
+    int32 parentInode = sfsLookup(parentBuf);
+    if (parentInode < 0)
+        return false;
+    /* Same parent-directory write check as createNode above -- removing an
+       entry needs write permission on the PARENT, not the entry itself,
+       mirroring vfs.c's vfsUnlink/vfsRmdir's own equivalent tmpfs check. */
+    if (!vfsPermitted(sfsModeOf(parentInode), sfsUidOf(parentInode), sfsGidOf(parentInode),
+                       currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+        return false;
+    int32 target = dirFind(parentInode, leaf, strlen(leaf));
+    if (target < 0)
+        return false;
+
+    SfsInode inode;
+    if (!readInode(target, &inode))
+        return false;
+    if (inode.type == sfsTypeDir && inode.size > 0)
+        return false;
+
+    if (!dirRemove(parentInode, leaf, strlen(leaf)))
+        return false;
+
+    if (inode.linkCount > 1) {
+        inode.linkCount--;
+        inode.ctime = (uint32)rtcNow();
+        return writeInodeRaw(target, &inode);
+    }
+
+    if (!sfsTruncateInode(&inode, target, 0))
+        return false;
+    freeInodeNum(target);
+    return true;
+}
+
+uint64 sfsSizeOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.size;
+}
+
+uint32 sfsTypeOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return sfsTypeFree;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return sfsTypeFree;
+    return inode.type;
+}
+
+uint64 sfsMtimeOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.mtime;
+}
+
+uint64 sfsCtimeOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.ctime;
+}
+
+uint32 sfsModeOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.mode;
+}
+
+bool sfsChmod(int32 inodeNum, uint32 mode)
+{
+    if (!isMounted || inodeNum <= 0)
+        return false;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return false;
+    inode.mode = mode;
+    inode.ctime = (uint32)rtcNow();
+    return writeInodeRaw(inodeNum, &inode);
+}
+
+uint32 sfsUidOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.uid;
+}
+
+bool sfsChown(int32 inodeNum, uint32 newUid)
+{
+    if (!isMounted || inodeNum <= 0)
+        return false;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return false;
+    inode.uid = newUid;
+    inode.ctime = (uint32)rtcNow();
+    return writeInodeRaw(inodeNum, &inode);
+}
+
+uint32 sfsGidOf(int32 inodeNum)
+{
+    if (!isMounted || inodeNum <= 0)
+        return 0;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return 0;
+    return inode.gid;
+}
+
+bool sfsChgrp(int32 inodeNum, uint32 newGid)
+{
+    if (!isMounted || inodeNum <= 0)
+        return false;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return false;
+    inode.gid = newGid;
+    inode.ctime = (uint32)rtcNow();
+    return writeInodeRaw(inodeNum, &inode);
+}
+
+bool sfsTruncate(int32 inodeNum, uint64 newSize)
+{
+    if (!isMounted || inodeNum <= 0 || newSize > 0xFFFFFFFFu)
+        return false;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return false;
+    if (inode.type != sfsTypeFile)
+        return false;
+    return sfsTruncateInode(&inode, inodeNum, (uint32)newSize);
+}
+
+int64 sfsReadAt(int32 inodeNum, uint64 offset, void* buffer, uint64 length)
+{
+    if (!isMounted || inodeNum <= 0)
+        return -1;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return -1;
+    if (inode.type != sfsTypeFile && inode.type != sfsTypeDir && inode.type != sfsTypeSymlink)
+        return -1;
+    if (offset >= inode.size)
+        return 0;
+
+    uint64 want = length;
+    if (want > (uint64)inode.size - offset)
+        want = (uint64)inode.size - offset;
+
+    uint8* dst = (uint8*)buffer;
+    uint64 done = 0;
+    while (done < want) {
+        uint64 pos = offset + done;
+        uint32 logicalBlock = (uint32)(pos / sfsBlockSize);
+        uint32 within = (uint32)(pos % sfsBlockSize);
+        uint32 chunk = sfsBlockSize - within;
+        if ((uint64)chunk > want - done)
+            chunk = (uint32)(want - done);
+
+        uint32 blockAbs;
+        if (getBlockForRead(&inode, logicalBlock, &blockAbs)) {
+            uint8 blockBuf[sfsBlockSize];
+            if (!blockRead(blockAbs, blockBuf))
+                break;
+            memcpy(dst + done, blockBuf + within, chunk);
+        } else {
+            memset(dst + done, 0, chunk);
+        }
+        done += chunk;
+    }
+    return (int64)done;
+}
+
+int64 sfsWriteAt(int32 inodeNum, uint64 offset, const void* buffer, uint64 length)
+{
+    if (!isMounted || inodeNum <= 0)
+        return -1;
+    SfsInode inode;
+    if (!readInode(inodeNum, &inode))
+        return -1;
+    if (inode.type != sfsTypeFile && inode.type != sfsTypeDir && inode.type != sfsTypeSymlink)
+        return -1;
+    if (length == 0)
+        return 0;
+
+    if (offset > inode.size) {
+        if (!sfsWriteRaw(&inode, inodeNum, inode.size, nullptr, offset - inode.size))
+            return -1;
+    }
+    if (!sfsWriteRaw(&inode, inodeNum, offset, buffer, length))
+        return -1;
+    return (int64)length;
+}
+
+bool sfsReaddirAt(int32 dirInode, uint32 index, char* nameOut, uint32 nameCap, uint32* typeOut)
+{
+    if (!isMounted || sfsTypeOf(dirInode) != sfsTypeDir)
+        return false;
+
+    SfsDirEntry entry;
+    uint64 pos = (uint64)index * sizeof(SfsDirEntry);
+    if (sfsReadAt(dirInode, pos, &entry, sizeof(entry)) != (int64)sizeof(entry))
+        return false;
+
+    uint64 nlen = strlen(entry.name);
+    if (nlen >= nameCap)
+        nlen = nameCap - 1;
+    memcpy(nameOut, entry.name, nlen);
+    nameOut[nlen] = 0;
+    if (typeOut)
+        *typeOut = entry.type;
+    return true;
+}
