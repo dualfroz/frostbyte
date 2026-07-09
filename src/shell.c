@@ -956,58 +956,148 @@ static void printThreads(void)
 
 static void buildPath(const char* argument, char* out)
 {
-    if (argument[0] == '/') {
-        uint64 length = strlen(argument);
-        if (length >= pathCapacity)
-            length = pathCapacity - 1;
-        memcpy(out, argument, length);
-        out[length] = 0;
-        return;
-    }
-
-    uint64 pos = strlen(cwd);
-    if (pos >= pathCapacity)
-        pos = pathCapacity - 1;
-    memcpy(out, cwd, pos);
-    if (pos == 0 || out[pos - 1] != '/') {
-        if (pos < pathCapacity - 1)
-            out[pos++] = '/';
-    }
-    for (uint64 i = 0; argument[i] && pos < pathCapacity - 1; i++)
-        out[pos++] = argument[i];
-    out[pos] = 0;
+    vfsResolvePath(argument, out, pathCapacity);
 }
 
-static void listDir(const char* argument)
+/* One line of `ls` output for a single entry, real stat data (fs.h's
+   FbStat) already resolved by the caller -- shared by both the plain and
+   `-l` formats and by the "argument names a file, not a directory" case
+   below, so all three ever only format an FbStat one way. */
+static void printLsEntry(bool longFormat, const FbStat* stat, const char* name)
 {
-    char path[pathCapacity];
-    if (argument[0] == 0)
-        memcpy(path, cwd, strlen(cwd) + 1);
-    else
-        buildPath(argument, path);
+    char typeChar = stat->type == fsTypeDir ? 'd' : (stat->type == fsTypeFifo ? 'p' : 'f');
 
-    VfsNode* node = vfsLookup(path);
-    if (!node) {
-        kprintf("ls: no such path: %s\n", path);
-        return;
-    }
-    if (!vfsIsDir(node)) {
-        kprintf("%s  %lu\n", vfsName(node), vfsSize(node));
-        return;
-    }
-    for (VfsNode* child = vfsChild(node); child; child = vfsNext(child)) {
-        if (vfsIsDir(child))
-            kprintf("%s/\n", vfsName(child));
+    if (!longFormat) {
+        if (stat->type == fsTypeDir)
+            kprintf("%s/\n", name);
         else
-            kprintf("%s  %lu\n", vfsName(child), vfsSize(child));
+            kprintf("%s  %lu\n", name, stat->size);
+        return;
+    }
+
+    /* Deliberately prints type/size/name BEFORE the date: a needle that
+       greps for a known type+size+name substring (tools/ci-test.sh) then
+       never has to also match today's wall-clock date, which is real and
+       therefore different on every run. The real owner/group/other rwx
+       permission string (fs.h's fsModeOwner*, fsModeGroup*, fsModeOther*) is
+       appended AFTER the date for the same reason, in the other direction
+       -- every existing needle that greps a type+size+name+date-prefix
+       substring keeps matching unchanged, since nothing before it in the
+       line moved (only perm itself grew longer, from 3 chars to the full
+       9-char rwxrwxrwx real `ls -l` prints, now that a real gid exists to
+       make the group triad meaningful). */
+    char perm[10];
+    perm[0] = (stat->mode & fsModeOwnerRead) ? 'r' : '-';
+    perm[1] = (stat->mode & fsModeOwnerWrite) ? 'w' : '-';
+    perm[2] = (stat->mode & fsModeOwnerExec) ? 'x' : '-';
+    perm[3] = (stat->mode & fsModeGroupRead) ? 'r' : '-';
+    perm[4] = (stat->mode & fsModeGroupWrite) ? 'w' : '-';
+    perm[5] = (stat->mode & fsModeGroupExec) ? 'x' : '-';
+    perm[6] = (stat->mode & fsModeOtherRead) ? 'r' : '-';
+    perm[7] = (stat->mode & fsModeOtherWrite) ? 'w' : '-';
+    perm[8] = (stat->mode & fsModeOtherExec) ? 'x' : '-';
+    perm[9] = 0;
+
+    kprintf("%c %lu %s ", typeChar, stat->size, name);
+    if (stat->mtime == 0) {
+        /* tmpfs/dev entries never track time (fs.h's FbStat comment) --
+           an honest "no timestamp" marker instead of a fake 1970 date. */
+        kprintf("- %s\n", perm);
+    } else {
+        RtcDateTime dt;
+        rtcCivilFromEpoch((int64)stat->mtime, &dt);
+        kprintf("%04ld-%02ld-%02ld %02ld:%02ld:%02ld %s\n",
+                dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, perm);
     }
 }
 
-static void catFile(const char* argument)
+/* `ls [-l] [PATH]` -- generalized over vfsOpen/vfsGetdents/vfsStat
+   (fs.h/vfs.h) instead of the old tmpfs-only vfsLookup/vfsChild/vfsNext
+   VfsNode-tree walk, so a directory under `/mnt` (SFS) can finally be
+   listed from the interactive shell at all (previously vfsLookup, which
+   only ever understood the in-memory tmpfs tree, silently returned "no
+   such path" for every SFS directory -- fstest.c/linktest.c could only
+   ever prove SFS directory listing through a raw userGetdents syscall,
+   never through this builtin). `-l` adds real stat data per entry (type,
+   size, mtime -- sfs.h's on-disk timestamps, FALA 39) the same way a real
+   `ls -l` would. */
+/* Returns 0 on success, 1 on failure (real POSIX `ls` exit-status shape) --
+   feeds shell.c's new `&&`/`||` conditional chaining (execute()) the same
+   way a spawned program's own real exit code already does, see
+   shellSplitAndOr's own doc comment in shell.h. */
+static int listDir(const char* argument)
+{
+    bool longFormat = false;
+    if (argument[0] == '-' && argument[1] == 'l' && (argument[2] == 0 || argument[2] == ' ')) {
+        longFormat = true;
+        argument += 2;
+        while (*argument == ' ')
+            argument++;
+    }
+
+    char path[pathCapacity];
+    buildPath(argument, path);
+
+    FbStat stat;
+    if (vfsStat(path, &stat) != 0) {
+        kprintf("ls: no such path: %s\n", path);
+        return 1;
+    }
+
+    if (stat.type != fsTypeDir) {
+        const char* base = path;
+        for (const char* p = path; *p; p++) {
+            if (*p == '/')
+                base = p + 1;
+        }
+        printLsEntry(longFormat, &stat, base);
+        return 0;
+    }
+
+    int fd = vfsOpen(path, oReadOnly);
+    if (fd < 0) {
+        kprintf("ls: cannot open %s\n", path);
+        return 1;
+    }
+
+    uint64 pathLen = strlen(path);
+    if (pathLen >= pathCapacity)
+        pathLen = pathCapacity - 1;
+    bool needSlash = pathLen == 0 || path[pathLen - 1] != '/';
+
+    FbDirent entries[16];
+    int64 bytes;
+    while ((bytes = vfsGetdents(fd, entries, sizeof(entries))) > 0) {
+        int64 count = bytes / (int64)sizeof(FbDirent);
+        for (int64 i = 0; i < count; i++) {
+            char childPath[pathCapacity];
+            uint64 childLen = pathLen;
+            memcpy(childPath, path, childLen);
+            if (needSlash && childLen < pathCapacity - 1)
+                childPath[childLen++] = '/';
+            uint64 nameLen = strlen(entries[i].name);
+            if (childLen + nameLen >= pathCapacity)
+                nameLen = pathCapacity - 1 - childLen;
+            memcpy(childPath + childLen, entries[i].name, nameLen);
+            childPath[childLen + nameLen] = 0;
+
+            FbStat childStat;
+            if (vfsStat(childPath, &childStat) == 0)
+                printLsEntry(longFormat, &childStat, entries[i].name);
+            else
+                kprintf("%s  ?\n", entries[i].name);
+        }
+    }
+    vfsClose(fd);
+    return 0;
+}
+
+/* Same "0 success, 1 failure" shape listDir above uses. */
+static int catFile(const char* argument)
 {
     if (argument[0] == 0) {
         kprintf("cat: missing file\n");
-        return;
+        return 1;
     }
     char path[pathCapacity];
     buildPath(argument, path);
@@ -1015,16 +1105,17 @@ static void catFile(const char* argument)
     VfsNode* node = vfsLookup(path);
     if (!node) {
         kprintf("cat: no such file: %s\n", path);
-        return;
+        return 1;
     }
     if (vfsIsDir(node)) {
         kprintf("cat: %s is a directory\n", path);
-        return;
+        return 1;
     }
     const char* data = (const char*)vfsFileData(node);
     uint64 size = vfsSize(node);
     for (uint64 i = 0; i < size; i++)
         kputchar(data[i]);
+    return 0;
 }
 
 static void echoWrite(char* text, const char* target)
@@ -1043,19 +1134,188 @@ static void echoWrite(char* text, const char* target)
     vfsClose(fd);
 }
 
-static void makeDir(const char* argument)
+/* Same "0 success, 1 failure" shape listDir/catFile above use. */
+static int makeDir(const char* argument)
 {
     if (argument[0] == 0) {
         kprintf("mkdir: missing path\n");
-        return;
+        return 1;
     }
     char path[pathCapacity];
     buildPath(argument, path);
-    if (vfsMkdir(path) != 0)
+    if (vfsMkdir(path) != 0) {
         kprintf("mkdir: cannot create %s\n", path);
+        return 1;
+    }
+    return 0;
 }
 
-static void changeDir(const char* argument)
+/* Real `rm`: refuses a directory outright (real rm without -r never
+   descends), matching vfsUnlink's own EISDIR-shaped refusal (vfs.c) --
+   the vfsStat check here exists only to give a friendlier message than
+   vfsUnlink's plain -1 would on its own, the actual enforcement is
+   vfsUnlink's, not this. */
+static int removeFile(const char* argument)
+{
+    if (argument[0] == 0) {
+        kprintf("rm: missing path\n");
+        return 1;
+    }
+    char path[pathCapacity];
+    buildPath(argument, path);
+
+    FbStat stat;
+    if (vfsStat(path, &stat) != 0) {
+        kprintf("rm: no such file: %s\n", path);
+        return 1;
+    }
+    if (stat.type == fsTypeDir) {
+        kprintf("rm: %s: is a directory\n", path);
+        return 1;
+    }
+    if (vfsUnlink(path) != 0) {
+        kprintf("rm: cannot remove %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Real `rmdir`: only ever removes an EMPTY directory, same split from `rm`
+   above that real rmdir(2)/unlink(2) have. */
+static int removeDir(const char* argument)
+{
+    if (argument[0] == 0) {
+        kprintf("rmdir: missing path\n");
+        return 1;
+    }
+    char path[pathCapacity];
+    buildPath(argument, path);
+
+    FbStat stat;
+    if (vfsStat(path, &stat) != 0) {
+        kprintf("rmdir: no such directory: %s\n", path);
+        return 1;
+    }
+    if (stat.type != fsTypeDir) {
+        kprintf("rmdir: %s: not a directory\n", path);
+        return 1;
+    }
+    if (vfsRmdir(path) != 0) {
+        kprintf("rmdir: %s: not empty\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Real `chmod MODE PATH`: MODE is parsed as octal (strtoul base 8, klib.h),
+   matching real chmod(1)'s numeric-mode convention -- "755" already means
+   0755, no leading 0 required. Both the owner AND other triads are
+   meaningful now that a real uid model exists (fs.h's fsModeOwner and
+   fsModeOther bits, vfs.c's vfsPermitted) -- refused outright unless the
+   caller owns the target or is uid 0 (vfsChmod's own vfsOwnerOrRoot check).
+   Symbolic modes (u+x, a=r, ...) are not supported, the same "numeric only"
+   scope every other new builtin in this shell has picked over a fuller
+   grammar it does not need. */
+static int doChmod(const char* argument)
+{
+    char modeText[16];
+    uint64 i = 0;
+    while (argument[i] && argument[i] != ' ' && i < sizeof(modeText) - 1) {
+        modeText[i] = argument[i];
+        i++;
+    }
+    modeText[i] = 0;
+
+    const char* rest = argument + i;
+    while (*rest == ' ')
+        rest++;
+
+    if (modeText[0] == 0 || rest[0] == 0) {
+        kprintf("chmod: usage: chmod MODE PATH\n");
+        return 1;
+    }
+
+    uint32 mode = (uint32)strtoul(modeText, nullptr, 8);
+    char path[pathCapacity];
+    buildPath(rest, path);
+    if (vfsChmod(path, mode) != 0) {
+        kprintf("chmod: cannot chmod %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Real `chown UID PATH`: UID is parsed as a plain decimal number (strtoul
+   base 10, klib.h), unlike chmod's octal MODE -- a uid is never a bitmask,
+   so there is no "leading digit means octal" convention to match. Refused
+   outright unless the caller is uid 0 (vfsChown's own root-only check) --
+   even the file's own owner may not give it away, matching real Unix's
+   _POSIX_CHOWN_RESTRICTED default. */
+static int doChown(const char* argument)
+{
+    char uidText[16];
+    uint64 i = 0;
+    while (argument[i] && argument[i] != ' ' && i < sizeof(uidText) - 1) {
+        uidText[i] = argument[i];
+        i++;
+    }
+    uidText[i] = 0;
+
+    const char* rest = argument + i;
+    while (*rest == ' ')
+        rest++;
+
+    if (uidText[0] == 0 || rest[0] == 0) {
+        kprintf("chown: usage: chown UID PATH\n");
+        return 1;
+    }
+
+    uint32 uid = (uint32)strtoul(uidText, nullptr, 10);
+    char path[pathCapacity];
+    buildPath(rest, path);
+    if (vfsChown(path, uid) != 0) {
+        kprintf("chown: cannot chown %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Real `chgrp GID PATH`: decimal like chown, not octal like chmod -- a gid
+   is never a bitmask either. Unlike chown (root-only, full stop), the
+   file's own owner may also call this, but only to set the group to THIS
+   shell's own current gid (vfsChgrp's own owner-may-only-name-their-own-gid
+   rule, see its doc comment) -- root may still set any gid. */
+static int doChgrp(const char* argument)
+{
+    char gidText[16];
+    uint64 i = 0;
+    while (argument[i] && argument[i] != ' ' && i < sizeof(gidText) - 1) {
+        gidText[i] = argument[i];
+        i++;
+    }
+    gidText[i] = 0;
+
+    const char* rest = argument + i;
+    while (*rest == ' ')
+        rest++;
+
+    if (gidText[0] == 0 || rest[0] == 0) {
+        kprintf("chgrp: usage: chgrp GID PATH\n");
+        return 1;
+    }
+
+    uint32 gid = (uint32)strtoul(gidText, nullptr, 10);
+    char path[pathCapacity];
+    buildPath(rest, path);
+    if (vfsChgrp(path, gid) != 0) {
+        kprintf("chgrp: cannot chgrp %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Same "0 success, 1 failure" shape as above. */
+static int changeDir(const char* argument)
 {
     char path[pathCapacity];
     if (argument[0] == 0)
@@ -1063,12 +1323,76 @@ static void changeDir(const char* argument)
     else
         buildPath(argument, path);
 
-    VfsNode* node = vfsLookup(path);
-    if (!node || !vfsIsDir(node)) {
+    /* vfsChdir (vfs.h) also understands "/mnt" directories -- unlike the
+       vfsLookup+vfsIsDir check this used to do, which only ever walked the
+       VfsNode tree (ustar/tmpfs) and so could never actually cd into the
+       persistent on-disk filesystem at all. */
+    if (vfsChdir(path) != 0) {
         kprintf("cd: no such directory: %s\n", path);
-        return;
+        return 1;
     }
-    vfsPath(node, cwd, sizeof(cwd));
+    return 0;
+}
+
+/* `export NAME=VALUE` -- real POSIX shell syntax, no quoting support
+   (matching every other built-in in this shell, e.g. doEcho below never
+   understands quotes either): the FIRST '=' splits `argument` into name
+   and value, everything after it becomes the value verbatim (including any
+   embedded spaces), the same "rest of the line, taken as-is" shape doEcho
+   already gives its own unredirected text. currentThreadSetEnv (sched.h)
+   sets it directly in THIS thread's own table -- the shell is a plain
+   kernel thread (shellRun's own comment above), so it needs no syscall to
+   reach its own state, exactly like changeDir calling vfsChdir directly
+   above. Any job spawned AFTER this call (jobctl.h, via threadCreateUser's
+   initialEnv) inherits a real copy of the new value. */
+/* Same "0 success, 1 failure" shape listDir/catFile/makeDir/changeDir
+   above use. */
+static int doExport(char* argument)
+{
+    char* eq = argument;
+    while (*eq && *eq != '=')
+        eq++;
+    if (*eq != '=' || eq == argument) {
+        kprintf("export: usage: export NAME=VALUE\n");
+        return 1;
+    }
+    *eq = 0;
+    const char* value = eq + 1;
+    if (!currentThreadSetEnv(argument, value)) {
+        kprintf("export: cannot set %s (name/value too long, or too many variables)\n", argument);
+        return 1;
+    }
+    return 0;
+}
+
+/* `unset NAME` -- real POSIX shell syntax, removes `argument` from this
+   thread's own environment table via currentThreadUnsetEnv (sched.h),
+   the exact same "no syscall needed, shell is a plain kernel thread"
+   shape as doExport above. Silently succeeds whether or not `argument`
+   actually had an entry (matching real unsetenv(3)'s own no-op-success
+   semantics for an already-absent name) -- the usage error below is only
+   for the "no argument at all" case, not "name not found", and (same "0
+   success, 1 failure" shape listDir/catFile/makeDir/changeDir/doExport
+   above use) the only way this can ever return failure. */
+static int doUnset(char* argument)
+{
+    if (argument[0] == 0) {
+        kprintf("unset: usage: unset NAME\n");
+        return 1;
+    }
+    currentThreadUnsetEnv(argument);
+    return 0;
+}
+
+/* `env` -- lists every "NAME=VALUE" this shell thread currently holds
+   (currentThreadEnvCount/currentThreadEnvEntry, sched.h), the same raw
+   storage format doExport above writes and shellExpandArgv's $NAME lookups
+   read. */
+static void printEnv(void)
+{
+    int count = currentThreadEnvCount();
+    for (int i = 0; i < count; i++)
+        kprintf("env: %s\n", currentThreadEnvEntry(i));
 }
 
 static void doEcho(char* argument)
@@ -1094,10 +1418,156 @@ static void doEcho(char* argument)
     }
 }
 
-static void execute(char* line)
+/* Upper bound on how many `$(...)` command substitutions execute() will
+   expand on one typed line -- the same "generous cap for one
+   lineCapacity-bounded line, not a claim real shells have such a limit"
+   reasoning shellMaxPipelineStages/shellMaxAndOrSegments already give
+   their own per-line caps. */
+#define shellMaxCommandSubst 4
+
+/* Expands every non-nested `$(cmd [args])` in `srcLine` into `outLine`,
+   left to right -- called from executeSingle below only once `&&`/`||`
+   (execute()'s own shellSplitAndOr, over the ORIGINAL typed line) and `|`
+   (executeSingle's own shellSplitPipelineStages, over THIS segment) have
+   already been resolved, so a literal `&&`/`||`/`|` byte sitting inside a
+   substituted command's own captured output can never be mistaken for a
+   real operator -- those are only ever recognized once, before any
+   expansion runs, exactly like a real shell's own grammar (operators are
+   parsed structurally first; expansion happens per-word afterward, never
+   the other way around).
+   Builds the result into a PRIVATE `work` copy first, splicing in place
+   there, rather than mutating `srcLine` itself: `srcLine` here is not
+   necessarily its own standalone buffer -- shellSplitAndOr/
+   shellSplitPipelineStages both split their input IN PLACE by writing NUL
+   terminators into ONE shared backing array (shell.h's own doc comments on
+   both), so a segment that still has ANOTHER segment's text sitting
+   immediately after its own NUL terminator would have that neighbor
+   silently corrupted by any in-place splice that grows past the original
+   text's own length. Working in a fully separate `work`/`outLine` buffer
+   makes that impossible regardless of how much the line grows or shrinks.
+   Each `$(...)` found (shellFindCommandSubst, shell.h) is run to
+   completion via jobctlCaptureOutput -- a REAL spawn, not a builtin (no fd
+   of its own to capture from, the same "no stage may be a builtin" scope
+   runPipelineStages already documents) -- with its own argv given
+   `$NAME`/`$?` expansion (shellExpandArgv) but nothing else: no wildcard
+   globs, no redirection, no pipes, no further `$(...)` nesting. Trailing
+   newlines are stripped from the captured output, matching a real shell's
+   own `$(...)`. Only ever scans PAST whatever it just spliced into `work`
+   (`scanFrom` below), never re-scanning a command's own captured output
+   for a further `$(` -- the same single-pass, no-second-expansion rule a
+   real shell gives command substitution's own result.
+   Returns true having written the fully expanded line into `outLine`
+   (unchanged from `srcLine` if there was nothing to expand), or false,
+   having already reported the error via kprintf and left `outLine`
+   untouched, on a malformed `$(` with no matching `)`, an unknown command,
+   a spliced result that would overflow lineCapacity, or more than
+   shellMaxCommandSubst substitutions on one line. */
+static bool shellExpandCommandSubst(const char* srcLine, char* outLine, int outCap)
+{
+    char work[lineCapacity];
+    snprintf(work, sizeof(work), "%s", srcLine);
+
+    int scanFrom = 0;
+
+    for (int iterations = 0; iterations < shellMaxCommandSubst; iterations++) {
+        int start, end;
+        char cmd[lineCapacity];
+        if (!shellFindCommandSubst(work + scanFrom, &start, &end, cmd, sizeof(cmd))) {
+            kprintf("shell: '$(' with no matching ')'\n");
+            return false;
+        }
+        if (start < 0) {
+            snprintf(outLine, (uint64)outCap, "%s", work);
+            return true;
+        }
+        start += scanFrom;
+        end += scanFrom;
+
+        char* word;
+        char* rest;
+        splitCommandWord(cmd, &word, &rest);
+
+        char* argv[shellMaxArgs];
+        int argc = 0;
+        argv[argc++] = word;
+        argc += shellTokenize(rest, &argv[argc], shellMaxArgs - argc);
+
+        char expandedArgv[shellMaxArgs][envEntryMax];
+        shellExpandArgv(argv + 1, argc - 1, expandedArgv + 1);
+
+        char binPath[binPathCapacity];
+        snprintf(binPath, sizeof(binPath), "/bin/%s", word);
+
+        char captured[lineCapacity];
+        int64 status;
+        bool spawned = jobctlCaptureOutput(binPath, (const char* const*)argv, argc,
+                                            captured, sizeof(captured), &status);
+        /* Deliberately discarded: real shells leave `$?` reflecting the
+           OUTER command that actually runs after substitution completes,
+           never the substituted command itself (executeSingle/execute
+           already set lastStatus from whatever this line goes on to
+           spawn). */
+        (void)status;
+        if (!spawned) {
+            kprintf("%s: command substitution failed (unknown command)\n", word);
+            return false;
+        }
+
+        int capturedLen = (int)strlen(captured);
+        while (capturedLen > 0 && captured[capturedLen - 1] == '\n')
+            captured[--capturedLen] = 0;
+
+        int tailLen = (int)strlen(work + end);
+        if (start + capturedLen + tailLen + 1 > lineCapacity) {
+            kprintf("shell: command substitution result too long\n");
+            return false;
+        }
+
+        memmove(work + start + capturedLen, work + end, (uint64)(tailLen + 1));
+        memcpy(work + start, captured, (uint64)capturedLen);
+
+        scanFrom = start + capturedLen;
+    }
+
+    kprintf("shell: too many '$(' substitutions (max %d)\n", shellMaxCommandSubst);
+    return false;
+}
+
+/* Runs exactly one command-or-pipeline (never itself another `&&`/`||`
+   chain -- shellSplitAndOr has already peeled those apart before this is
+   ever called, see execute() below) and returns its real exit status: a
+   builtin's own 0/1 (listDir/catFile/makeDir/changeDir/doExport/doUnset),
+   0 for every other builtin (none of them has a documented failure case),
+   or whatever runProgram/runPipelineStages themselves return for a
+   spawned command or pipeline. This used to be the entire body of
+   execute() itself, before shell.c had any notion of chaining multiple
+   commands' exit statuses together. */
+static int64 executeSingle(char* line)
 {
     if (line[0] == 0)
-        return;
+        return 0;
+
+    char* pipeStages[shellMaxPipelineStages];
+    int pipeStageCount = shellSplitPipelineStages(line, pipeStages, shellMaxPipelineStages);
+    if (pipeStageCount == -1) {
+        kprintf("pipeline: too many '|' stages (max %d)\n", shellMaxPipelineStages);
+        return shellExecNotFound;
+    }
+    if (pipeStageCount > 0)
+        return runPipelineStages(pipeStages, pipeStageCount);
+
+    /* `$(cmd)` command substitution (shellExpandCommandSubst above) only
+       ever runs for a single, non-piped command -- an honestly-scoped
+       limitation matching this file's own history of landing a feature for
+       the plain case first and generalizing to pipeline stages in a later
+       fala (`<<<` here-strings took the same path: jobctlSpawnForegroundHereString
+       landed before jobctlSpawnPipedHereString ever fed a pipeline's first
+       stage). `|` has already been ruled out above (pipeStageCount == 0),
+       so nothing here can still be misread as a pipe. */
+    char expandedLine[lineCapacity];
+    if (!shellExpandCommandSubst(line, expandedLine, sizeof(expandedLine)))
+        return shellExecNotFound;
+    line = expandedLine;
 
     char* argument = line;
     while (*argument && *argument != ' ')
@@ -1109,30 +1579,111 @@ static void execute(char* line)
     while (*argument == ' ')
         argument++;
 
-    if (strcmp(line, "help") == 0)
+    if (strcmp(line, "help") == 0) {
         printHelp();
-    else if (strcmp(line, "echo") == 0)
+        return 0;
+    } else if (strcmp(line, "echo") == 0) {
         doEcho(argument);
-    else if (strcmp(line, "ls") == 0)
-        listDir(argument);
+        return 0;
+    } else if (strcmp(line, "ls") == 0)
+        return listDir(argument);
     else if (strcmp(line, "cat") == 0)
-        catFile(argument);
+        return catFile(argument);
     else if (strcmp(line, "mkdir") == 0)
-        makeDir(argument);
+        return makeDir(argument);
+    else if (strcmp(line, "rm") == 0)
+        return removeFile(argument);
+    else if (strcmp(line, "rmdir") == 0)
+        return removeDir(argument);
+    else if (strcmp(line, "chmod") == 0)
+        return doChmod(argument);
+    else if (strcmp(line, "chown") == 0)
+        return doChown(argument);
+    else if (strcmp(line, "chgrp") == 0)
+        return doChgrp(argument);
     else if (strcmp(line, "cd") == 0)
-        changeDir(argument);
-    else if (strcmp(line, "pwd") == 0)
-        kprintf("%s\n", cwd);
-    else if (strcmp(line, "mem") == 0)
+        return changeDir(argument);
+    else if (strcmp(line, "pwd") == 0) {
+        char path[pathCapacity];
+        vfsGetcwd(path, sizeof(path));
+        kprintf("%s\n", path);
+        return 0;
+    }
+    else if (strcmp(line, "whoami") == 0) {
+        kprintf("%u\n", currentThreadUid());
+        return 0;
+    }
+    else if (strcmp(line, "mem") == 0) {
         printMem();
-    else if (strcmp(line, "uptime") == 0)
+        return 0;
+    } else if (strcmp(line, "uptime") == 0) {
         printUptime();
-    else if (strcmp(line, "ps") == 0)
+        return 0;
+    } else if (strcmp(line, "ps") == 0) {
         printThreads();
-    else if (strcmp(line, "clear") == 0)
+        return 0;
+    } else if (strcmp(line, "jobs") == 0) {
+        listBackgroundJobs();
+        return 0;
+    } else if (strcmp(line, "export") == 0)
+        return doExport(argument);
+    else if (strcmp(line, "env") == 0) {
+        printEnv();
+        return 0;
+    } else if (strcmp(line, "unset") == 0)
+        return doUnset(argument);
+    else if (strcmp(line, "clear") == 0) {
         vgaClear();
-    else
-        kprintf("unknown command: %s (try 'help')\n", line);
+        return 0;
+    } else
+        return runProgram(line, argument);
+}
+
+/* Splits `line` at every top-level `&&`/`||` (shellSplitAndOr, shell.h)
+   and runs each segment left to right through executeSingle above,
+   short-circuiting exactly like a real shell: a segment preceded by `&&`
+   only runs if the PREVIOUS segment that actually ran (not necessarily the
+   lexically previous one -- a skipped segment leaves `status` completely
+   unchanged) exited 0, one preceded by `||` only runs if that same status
+   was nonzero. This is real conditional chaining WITHIN a single typed
+   line (`cmd1 && cmd2 || cmd3`, the classic shell if-then-else idiom).
+   `lastStatus` (this file's own file-scope static above) is updated right
+   after every executeSingle() call below, chained or not -- a real shell's
+   own `$?` updates after EVERY simple command, including mid-chain (so
+   `false || echo $?` sees `false`'s own status while evaluating `echo`'s
+   argv, not some later value), and survives PAST this function returning,
+   so a later, completely separate typed line can still read it via
+   shellExpandToken's own `$?` handling -- closing the "no persistent `$?`
+   across separately typed lines" gap this file used to document here as a
+   deliberate limitation. A SKIPPED segment leaves `lastStatus` untouched
+   exactly like it already leaves the local chaining `status` untouched. */
+static void execute(char* line)
+{
+    if (line[0] == 0)
+        return;
+
+    char* andOrSegments[shellMaxAndOrSegments];
+    ShellAndOrOp andOrOps[shellMaxAndOrSegments - 1];
+    int andOrCount = shellSplitAndOr(line, andOrSegments, andOrOps, shellMaxAndOrSegments);
+    if (andOrCount == -1) {
+        kprintf("shell: too many '&&'/'||' segments (max %d)\n", shellMaxAndOrSegments);
+        return;
+    }
+    if (andOrCount == 0) {
+        lastStatus = executeSingle(line);
+        return;
+    }
+
+    int64 status = 0;
+    for (int i = 0; i < andOrCount; i++) {
+        if (i > 0) {
+            bool shouldRun = (andOrOps[i - 1] == shellAndOrAnd) ? (status == 0) : (status != 0);
+            if (!shouldRun)
+                continue;
+        }
+        status = executeSingle(andOrSegments[i]);
+        lastStatus = status;
+    }
 }
 
 void shellRun(void)
@@ -1140,17 +1691,34 @@ void shellRun(void)
     char line[lineCapacity];
     uint32 length = 0;
 
+    /* The shell is its own independent console reader (keyboard.h), same as
+       every ring-3 process's fd 0 -- a keystroke keyboardHandleScancode
+       decodes is broadcast to every open reader, this one included, so the
+       shell keeps working unchanged even while other processes are also
+       blocked reading fd 0 (see the consoleReaderA/consoleReaderB live boot
+       demo in kmain.c). Plain kernel-thread context (not a syscall
+       handler), so the blocking helper's real halt() loop is safe here,
+       exactly like pipeReadBlocking's callers. */
+    int reader = keyboardOpenReader();
+    if (reader == consoleReaderInvalid) {
+        kprintf("[shell] console reader table full, shell has no input\n");
+        for (;;)
+            halt();
+    }
+
     kprintf("\nfrostbyte shell ready. type 'help'.\n");
     kprintf("frostbyte> ");
 
     for (;;) {
-        char c = keyboardReadChar();
+        char c;
+        keyboardReaderReadBlocking(reader, &c, 1);
 
         if (c == '\n') {
             kputchar('\n');
             line[length] = 0;
             execute(line);
             length = 0;
+            reapFinishedBackgroundJobs();
             kprintf("frostbyte> ");
         } else if (c == '\b') {
             if (length > 0) {
