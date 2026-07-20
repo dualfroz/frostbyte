@@ -903,6 +903,175 @@ int vfsClose(int fd)
     return 0;
 }
 
+int vfsPipe(int* readFd, int* writeFd)
+{
+    int rfd = allocFd();
+    if (rfd < 0)
+        return -1;
+    currentThread()->fds[rfd].kind = fdPipeRead;
+
+    int wfd = allocFd();
+    if (wfd < 0) {
+        currentThread()->fds[rfd].kind = fdFree;
+        return -1;
+    }
+    currentThread()->fds[wfd].kind = fdPipeWrite;
+
+    int handle = pipeCreate();
+    if (handle < 0) {
+        currentThread()->fds[rfd].kind = fdFree;
+        currentThread()->fds[wfd].kind = fdFree;
+        return -1;
+    }
+
+    currentThread()->fds[rfd].pipeHandle = handle;
+    currentThread()->fds[wfd].pipeHandle = handle;
+    *readFd = rfd;
+    *writeFd = wfd;
+    return 0;
+}
+
+int vfsPipeCreateHandle(void)
+{
+    return pipeCreateDetached();
+}
+
+int vfsPipeAttach(int handle, bool wantWrite)
+{
+    if (!pipeValid(handle))
+        return -1;
+
+    int fd = allocFd();
+    if (fd < 0)
+        return -1;
+
+    FileDescriptor* d = &currentThread()->fds[fd];
+    d->node = nullptr;
+    d->offset = 0;
+    d->kind = wantWrite ? fdPipeWrite : fdPipeRead;
+    d->flags = fdFlagBlocking;
+    d->pipeHandle = handle;
+
+    if (wantWrite)
+        pipeAddWriter(handle);
+    else
+        pipeAddReader(handle);
+    return fd;
+}
+
+void vfsPipeAttachInto(FileDescriptor* targetFds, int fd, int handle, bool wantWrite)
+{
+    if (!pipeValid(handle))
+        return;
+
+    FileDescriptor* d = &targetFds[fd];
+    d->node = nullptr;
+    d->offset = 0;
+    d->kind = wantWrite ? fdPipeWrite : fdPipeRead;
+    d->flags = fdFlagBlocking;
+    d->pipeHandle = handle;
+
+    if (wantWrite)
+        pipeAddWriter(handle);
+    else
+        pipeAddReader(handle);
+}
+
+int vfsPidfdOpen(uint32 targetId)
+{
+    int handle = pidfdOpen(targetId);
+    if (handle < 0)
+        return -1;
+
+    int fd = allocFd();
+    if (fd < 0) {
+        pidfdClose(handle);
+        return -1;
+    }
+
+    FileDescriptor* d = &currentThread()->fds[fd];
+    d->node = nullptr;
+    d->offset = 0;
+    d->kind = fdPidfd;
+    d->flags = 0;
+    d->pipeHandle = handle;
+    return fd;
+}
+
+uint32 vfsPidfdTarget(int fd)
+{
+    FileDescriptor* d = fdAt(fd);
+    if (!d || d->kind != fdPidfd)
+        return threadInvalidId;
+    return pidfdTarget(d->pipeHandle);
+}
+
+const void* vfsBlockingChannel(int fd, bool forWrite)
+{
+    FileDescriptor* d = fdAt(fd);
+    if (!d || !(d->flags & fdFlagBlocking))
+        return nullptr;
+
+    if (d->kind == fdPipeRead || d->kind == fdPipeWrite) {
+        if (forWrite) {
+            if (d->kind != fdPipeWrite || pipeWriteBroken(d->pipeHandle))
+                return nullptr;
+        } else if (d->kind != fdPipeRead) {
+            return nullptr;
+        }
+        return pipeChannel(d->pipeHandle);
+    }
+
+    if (d->kind == fdConsole) {
+        /* Console writes (kputchar) are never buffered and never block. */
+        if (forWrite)
+            return nullptr;
+        return keyboardReaderChannel(d->pipeHandle);
+    }
+
+    return nullptr;
+}
+
+bool vfsPollReady(int fd, int16 events, int16* outRevents)
+{
+    int16 revents = 0;
+    FileDescriptor* d = fdAt(fd);
+    if (!d) {
+        *outRevents = pollNval;
+        return true;
+    }
+
+    switch (d->kind) {
+    case fdPipeRead:
+        if ((events & pollIn) && pipeHasData(d->pipeHandle))
+            revents |= pollIn;
+        break;
+    case fdPipeWrite:
+        if (pipeWriteBroken(d->pipeHandle))
+            revents |= pollErr;
+        else if ((events & pollOut) && pipeHasSpace(d->pipeHandle))
+            revents |= pollOut;
+        break;
+    case fdConsole:
+        if ((events & pollIn) && keyboardReaderHasData(d->pipeHandle))
+            revents |= pollIn;
+        /* Console writes (kputchar) are never buffered and never block --
+           see vfsBlockingChannel above. */
+        if (events & pollOut)
+            revents |= pollOut;
+        break;
+    default:
+        /* fdFile, fdBlockDev, fdSfs: every read/write on these runs to
+           completion synchronously (see vfsRead/vfsWrite below), exactly
+           like a real local filesystem always reports poll-ready. */
+        revents |= (int16)(events & (pollIn | pollOut));
+        break;
+    }
+
+    *outRevents = revents;
+    return revents != 0;
+}
+
 int64 vfsWrite(int fd, const void* buffer, uint64 length)
 {
     FileDescriptor* d = fdAt(fd);
@@ -915,6 +1084,15 @@ int64 vfsWrite(int fd, const void* buffer, uint64 length)
             kputchar(text[i]);
         return (int64)length;
     }
+
+    if (d->kind == fdPipeWrite)
+        return pipeWrite(d->pipeHandle, buffer, length);
+    if (d->kind == fdPipeRead)
+        return -1;
+    if (d->kind == fdBlockDev)
+        return blockDevWrite(d, buffer, length);
+    if (d->kind == fdSfs)
+        return sfsFdWrite(d, buffer, length);
 
     VfsNode* node = d->node;
     if (node->type != fsTypeFile || !node->writable)
@@ -933,6 +1111,15 @@ int64 vfsRead(int fd, void* buffer, uint64 length)
     FileDescriptor* d = fdAt(fd);
     if (!d)
         return -1;
+
+    if (d->kind == fdPipeRead)
+        return pipeRead(d->pipeHandle, buffer, length);
+    if (d->kind == fdPipeWrite)
+        return -1;
+    if (d->kind == fdBlockDev)
+        return blockDevRead(d, buffer, length);
+    if (d->kind == fdSfs)
+        return sfsFdRead(d, buffer, length);
 
     if (d->kind == fdConsole) {
         char* text = (char*)buffer;
