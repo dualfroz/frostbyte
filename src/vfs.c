@@ -727,31 +727,159 @@ static int resolveOpen(FileDescriptor* d, const char* path, uint32 flags)
             d->kind = wantWrite ? fdPipeWrite : fdPipeRead;
             d->flags = fdFlagBlocking;
             d->pipeHandle = handle;
+
+            if (wantWrite)
+                pipeAddWriter(handle);
+            else
+                pipeAddReader(handle);
+            return 0;
+        } else {
+            /* Real EACCES-shaped refusal: opening an EXISTING file for
+               writing without the right write bit for the CALLING thread's
+               identity (vfsPermitted, owner-vs-other-vs-root) fails at
+               open() time, before any fd (and therefore any write()) ever
+               exists -- matches real Unix, where permission is checked
+               once, at open, never re-checked against an fd already held.
+               A freshly oCreate'd file above always starts with
+               fsModeDefaultFile owned by its creator (has the owner-write
+               bit for exactly that uid), so this can never reject the
+               create-a-new-file path. */
+            if ((flags & (oWriteOnly | oReadWrite)) && sfsTypeOf(inodeNum) == sfsTypeFile
+                    && !vfsPermitted(sfsModeOf(inodeNum), sfsUidOf(inodeNum), sfsGidOf(inodeNum),
+                                     currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+                return -1;
+            /* Real EACCES-shaped refusal, the read-side counterpart of the
+               write check immediately above -- previously MISSING entirely
+               (a genuine, previously-undiscovered gap this fala's own
+               grouptest.c live demo found: a caller matching neither owner
+               nor group could still read a file with no read bit for
+               either, since nothing here ever consulted fsModeOwnerRead/
+               fsModeGroupRead/fsModeOtherRead for a plain file open, only
+               for a directory's own opendir()-shaped check below). Fires
+               for oReadOnly AND oReadWrite (real Unix's O_RDWR needs read
+               permission too, not just write) -- `!(flags & oWriteOnly)` is
+               the same 2-bit-access-mode test the fifo branch above already
+               uses to distinguish all three. */
+            if (!(flags & oWriteOnly) && sfsTypeOf(inodeNum) == sfsTypeFile
+                    && !vfsPermitted(sfsModeOf(inodeNum), sfsUidOf(inodeNum), sfsGidOf(inodeNum),
+                                     currentThreadUid(), currentThreadGid(), fsModeOwnerRead))
+                return -1;
+            /* Real opendir()-shaped refusal: listing a directory's own
+               entries (vfsGetdents below, on whatever fd this open()
+               eventually returns) needs read permission on the directory
+               ITSELF -- a separate bit from the exec/search permission
+               lookupNode/lookupFrom already require on every ANCESTOR
+               directory just to resolve this path down to here. */
+            if (sfsTypeOf(inodeNum) == sfsTypeDir
+                    && !vfsPermitted(sfsModeOf(inodeNum), sfsUidOf(inodeNum), sfsGidOf(inodeNum),
+                                      currentThreadUid(), currentThreadGid(), fsModeOwnerRead))
+                return -1;
+            if ((flags & oTrunc) && sfsTypeOf(inodeNum) == sfsTypeFile)
+                sfsTruncate(inodeNum, 0);
+        }
+
+        d->kind = fdSfs;
+        d->node = nullptr;
+        d->flags = flags;
+        d->pipeHandle = inodeNum;
+        d->offset = (flags & oAppend) ? sfsSizeOf(inodeNum) : 0;
+        return 0;
+    }
+
+    if (strcmp(path, blockDevPath) == 0) {
+        d->kind = fdBlockDev;
+        d->node = nullptr;
+        d->flags = flags;
+        d->offset = 0;
+        return 0;
+    }
+
     VfsNode* node = lookupNode(path);
     if (!node) {
         if (!(flags & oCreate))
             return -1;
         char leaf[fsNameMax];
         VfsNode* parent = splitParent(path, leaf, sizeof(leaf));
-        if (!parent || parent->type != fsTypeDir || !parent->writable)
+        if (!parent || parent->type != fsTypeDir || !parent->writable
+                || !vfsPermitted(parent->mode, parent->uid, parent->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
             return -1;
-        node = makeChildFile(parent, leaf, strlen(leaf), nullptr, 0, true);
+        node = makeChildFile(parent, leaf, strlen(leaf), nullptr, 0, true, fsModeDefaultFile);
         if (!node)
             return -1;
-    } else if ((flags & oTrunc) && node->type == fsTypeFile && node->writable) {
-        node->size = 0;
+    } else if (node->type == fsTypeFifo) {
+        /* One-directional only, exactly like vfsPipeAttach's wantWrite bool
+           -- a real O_RDWR fifo fd (Linux allows it; POSIX leaves it
+           undefined) has no equivalent here, since a single fd can only be
+           fdPipeRead or fdPipeWrite, never both. */
+        uint32 mode = flags & (oWriteOnly | oReadWrite);
+        bool wantWrite;
+        if (mode == oWriteOnly)
+            wantWrite = true;
+        else if (mode == oReadOnly)
+            wantWrite = false;
+        else
+            return -1;
+
+        d->node = nullptr;
+        d->offset = 0;
+        d->kind = wantWrite ? fdPipeWrite : fdPipeRead;
+        d->flags = fdFlagBlocking;
+        d->pipeHandle = node->pipeHandle;
+
+        if (wantWrite)
+            pipeAddWriter(node->pipeHandle);
+        else
+            pipeAddReader(node->pipeHandle);
+        return 0;
+    } else {
+        /* Same real EACCES-shaped refusal as the SFS branch above, applied
+           to tmpfs -- see that branch's comment for the full reasoning. */
+        if ((flags & (oWriteOnly | oReadWrite)) && node->type == fsTypeFile
+                && !vfsPermitted(node->mode, node->uid, node->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+            return -1;
+        /* Same real file-read check as the SFS branch above (its own
+           comment has the full "previously missing entirely" reasoning). */
+        if (!(flags & oWriteOnly) && node->type == fsTypeFile
+                && !vfsPermitted(node->mode, node->uid, node->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerRead))
+            return -1;
+        /* Same opendir()-shaped read check as the SFS branch above. */
+        if (node->type == fsTypeDir
+                && !vfsPermitted(node->mode, node->uid, node->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerRead))
+            return -1;
+        if ((flags & oTrunc) && node->type == fsTypeFile && node->writable)
+            node->size = 0;
     }
 
-    int fd = allocFd();
-    if (fd < 0)
-        return -1;
-
-    FileDescriptor* d = &currentThread()->fds[fd];
     d->kind = fdFile;
     d->node = node;
     d->flags = flags;
     d->offset = (flags & oAppend) ? node->size : 0;
+    return 0;
+}
+
+int vfsOpen(const char* path, uint32 flags)
+{
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+
+    int fd = allocFd();
+    if (fd < 0)
+        return -1;
+    if (resolveOpen(&currentThread()->fds[fd], resolvedPath, flags) < 0)
+        return -1;
     return fd;
+}
+
+int vfsOpenInto(FileDescriptor* targetFds, int fd, const char* path, uint32 flags)
+{
+    /* Resolved against the CALLING thread's own cwd (the spawning parent,
+       e.g. jobctl.c's redirect setup running before its not-yet-run child
+       ever executes) -- exactly the cwd `targetFds`'s own owner already
+       inherited a copy of at spawn time (initialCwd, sched.c), since
+       nothing chdirs in between a spawn and its immediate redirect setup. */
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    return resolveOpen(&targetFds[fd], resolvedPath, flags);
 }
 
 int vfsClose(int fd)
@@ -761,10 +889,17 @@ int vfsClose(int fd)
         return -1;
     if (d->kind == fdConsole)
         return 0;
+    if (d->kind == fdPipeRead)
+        pipeCloseRead(d->pipeHandle);
+    else if (d->kind == fdPipeWrite)
+        pipeCloseWrite(d->pipeHandle);
+    else if (d->kind == fdPidfd)
+        pidfdClose(d->pipeHandle);
     d->kind = fdFree;
     d->node = nullptr;
     d->offset = 0;
     d->flags = 0;
+    d->pipeHandle = -1;
     return 0;
 }
 
