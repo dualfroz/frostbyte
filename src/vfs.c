@@ -1364,6 +1364,235 @@ int vfsUnlink(const char* path)
     return 0;
 }
 
+/* Real rmdir(2): the counterpart vfsUnlink above deliberately refuses. Only
+   ever removes a directory, and only an EMPTY one (ENOTDIR/ENOTEMPTY in
+   real errno terms, both collapsed to -1 here like every other vfs.c entry
+   point). root itself can never be removed -- root is created non-writable
+   (nodeAlloc("/", ...) in vfsInit), so the same `!node->writable` check
+   every other mutating entry point already relies on covers it for free,
+   no separate identity check needed. */
+int vfsRmdir(const char* path)
+{
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0 || sfsTypeOf(inodeNum) != sfsTypeDir)
+            return -1;
+        /* sfsRemove's own `inode.type == sfsTypeDir && inode.size > 0`
+           check (sfs.c) still refuses a non-empty directory -- kept as
+           defense in depth rather than duplicated here. */
+        return sfsRemove(rel) ? 0 : -1;
+    }
+
+    VfsNode* node = lookupNode(path);
+    if (!node || !node->writable || node->type != fsTypeDir || node->firstChild)
+        return -1;
+
+    /* Same parent-directory write check as vfsUnlink above -- removing a
+       directory ENTRY needs write permission on the PARENT, not the
+       directory being removed itself. */
+    VfsNode* parent = node->parent;
+    if (!vfsPermitted(parent->mode, parent->uid, parent->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+        return -1;
+
+    VfsNode** link = &parent->firstChild;
+    while (*link && *link != node)
+        link = &(*link)->nextSibling;
+    if (*link)
+        *link = node->nextSibling;
+
+    kfree(node);
+    return 0;
+}
+
+bool vfsOwnerOrRoot(uint32 ownerUid, uint32 callerUid)
+{
+    return callerUid == 0 || callerUid == ownerUid;
+}
+
+int vfsChmod(const char* path, uint32 mode)
+{
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0)
+            return -1;
+        if (!vfsOwnerOrRoot(sfsUidOf(inodeNum), currentThreadUid()))
+            return -1;
+        return sfsChmod(inodeNum, mode) ? 0 : -1;
+    }
+
+    VfsNode* node = lookupNode(path);
+    if (!node || !node->writable)
+        return -1;
+    if (!vfsOwnerOrRoot(node->uid, currentThreadUid()))
+        return -1;
+    node->mode = mode;
+    return 0;
+}
+
+int vfsChown(const char* path, uint32 newUid)
+{
+    if (currentThreadUid() != 0)
+        return -1;
+
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0)
+            return -1;
+        return sfsChown(inodeNum, newUid) ? 0 : -1;
+    }
+
+    VfsNode* node = lookupNode(path);
+    if (!node || !node->writable)
+        return -1;
+    node->uid = newUid;
+    return 0;
+}
+
+int vfsChgrp(const char* path, uint32 newGid)
+{
+    uint32 callerUid = currentThreadUid();
+    bool isRoot = callerUid == 0;
+    /* Non-root: only the CALLER's own current gid may ever be assigned
+       (this kernel's one-gid-per-thread "membership"), and only by the
+       file's own owner -- both conditions checked up front so neither
+       branch below needs to repeat them. */
+    if (!isRoot && newGid != currentThreadGid())
+        return -1;
+
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0)
+            return -1;
+        if (!isRoot && sfsUidOf(inodeNum) != callerUid)
+            return -1;
+        return sfsChgrp(inodeNum, newGid) ? 0 : -1;
+    }
+
+    VfsNode* node = lookupNode(path);
+    if (!node || !node->writable)
+        return -1;
+    if (!isRoot && node->uid != callerUid)
+        return -1;
+    node->gid = newGid;
+    return 0;
+}
+
+int vfsSymlink(const char* path, const char* target)
+{
+    /* Only `path` (where the symlink itself is created) is resolved against
+       the calling thread's cwd -- `target` (the string stored INSIDE it) is
+       kept exactly as given, never resolved, matching real symlink(2)
+       (a relative target is only ever interpreted later, at traversal
+       time, relative to the symlink's own directory -- not the creating
+       process's cwd at creation time). */
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+
+    const char* rel;
+    if (!isSfsPath(resolvedPath, &rel))
+        return -1;
+    return sfsCreateSymlink(rel, target) >= 0 ? 0 : -1;
+}
+
+int64 vfsReadlink(const char* path, char* buffer, uint64 cap)
+{
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (!isSfsPath(path, &rel))
+        return -1;
+
+    int32 inodeNum = sfsLookupNoFollow(rel);
+    if (inodeNum < 0 || sfsTypeOf(inodeNum) != sfsTypeSymlink)
+        return -1;
+    if (!sfsReadlink(inodeNum, buffer, cap))
+        return -1;
+    return (int64)strlen(buffer);
+}
+
+int vfsLink(const char* existingPath, const char* newPath)
+{
+    char resolvedExisting[fsPathMax];
+    char resolvedNew[fsPathMax];
+    vfsResolvePath(existingPath, resolvedExisting, sizeof(resolvedExisting));
+    vfsResolvePath(newPath, resolvedNew, sizeof(resolvedNew));
+    existingPath = resolvedExisting;
+    newPath = resolvedNew;
+
+    const char* existingRel;
+    const char* newRel;
+    /* Cross-filesystem hardlinks (one path under /mnt, the other not) are
+       not supported -- same scope limit as a real link(2) across different
+       mounted filesystems (EXDEV), just expressed as a flat rejection since
+       this kernel has exactly one linkable filesystem. */
+    if (!isSfsPath(existingPath, &existingRel) || !isSfsPath(newPath, &newRel))
+        return -1;
+    return sfsLink(existingRel, newRel) >= 0 ? 0 : -1;
+}
+
+int vfsChdir(const char* path)
+{
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+
+    const char* rel;
+    if (isSfsPath(resolvedPath, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0 || sfsTypeOf(inodeNum) != sfsTypeDir)
+            return -1;
+        /* No parent-walk primitive exists for sfs.h inodes (unlike vfsPath
+           below for the VfsNode tree), so the /mnt branch stores exactly
+           what vfsResolvePath produced -- the one honestly-scoped gap
+           vfsChdir's own doc comment (vfs.h) calls out. */
+        return currentThreadSetCwd(resolvedPath) ? 0 : -1;
+    }
+
+    VfsNode* node = lookupNode(resolvedPath);
+    if (!node || node->type != fsTypeDir)
+        return -1;
+
+    /* Canonicalizes away any "."/".." components the caller typed by
+       walking the resolved node's REAL parent chain (vfsPath), rather than
+       storing vfsResolvePath's own plain string join verbatim -- shell.c's
+       old changeDir already did exactly this before this subsystem
+       existed, so this keeps that behavior for the VfsNode-tree case. */
+    char canonical[fsPathMax];
+    vfsPath(node, canonical, sizeof(canonical));
+    return currentThreadSetCwd(canonical) ? 0 : -1;
+}
+
+int64 vfsGetcwd(char* out, uint64 cap)
+{
+    const char* cwd = currentThreadCwd();
+    uint64 len = strlen(cwd);
+    if (len >= cap)
+        return -1;
+    memcpy(out, cwd, len + 1);
+    return (int64)len;
+}
+
 VfsNode* vfsLookup(const char* path)
 {
     return lookupNode(path);
@@ -1392,6 +1621,56 @@ bool vfsIsDir(VfsNode* node)
 uint64 vfsSize(VfsNode* node)
 {
     return node->size;
+}
+
+uint32 vfsMode(VfsNode* node)
+{
+    return node->mode;
+}
+
+uint32 vfsUid(VfsNode* node)
+{
+    return node->uid;
+}
+
+uint32 vfsGid(VfsNode* node)
+{
+    return node->gid;
+}
+
+/* Real Unix owner/other permission algorithm, the one real choke-point
+   piece of logic resolveOpen's two branches (tmpfs, SFS) and syscall.c's
+   loadImageByPath/jobctl.c's jobctlSpawn all now share instead of each
+   re-deriving it -- previously all four sites just tested a single bit
+   unconditionally (`mode & fsModeOwnerWrite`), honest only because there
+   was no uid model yet to make owner-vs-other meaningful. Deliberately a
+   pure function of its four arguments, not of "whoever is currently
+   running" -- every real call site passes currentThreadUid() in explicitly
+   for `callerUid`, so this stays testable against arbitrary uid/mode/owner
+   combinations without ever touching a live thread's own credential (see
+   coreTest.c's own KTEST coverage). `wantOwnerBit` is always one of
+   fs.h's fsModeOwner* constants; the matching "other" bit is derived by
+   shifting it right 6 (fsModeOther*'s own doc comment explains why that is
+   exact, not approximate) rather than requiring a second argument.
+
+   Deliberately NO uid-0-bypasses-everything superuser rule, unlike real
+   Unix's root: every boot-time process starts at uid 0 (sched.h's
+   Thread.uid doc comment), so a blanket bypass would have silently undone
+   the entire pre-existing "chmod denies write even to the file's own
+   creator" contract every current permission test (this file's own
+   resolveOpen tests, permtest.c's live demo) already relies on -- caught
+   by exactly those tests going red the first time this function existed
+   with a bypass in it. uid 0 is simply this kernel's default starting
+   identity, gated by the same owner/other bits as any other uid; its only
+   real asymmetry is currentThreadSetUid's own one-way privilege-drop rule
+   (sched.h), not a free pass here. */
+bool vfsPermitted(uint32 mode, uint32 ownerUid, uint32 ownerGid, uint32 callerUid, uint32 callerGid, uint32 wantOwnerBit)
+{
+    if (callerUid == ownerUid)
+        return (mode & wantOwnerBit) != 0;
+    if (callerGid == ownerGid)
+        return (mode & (wantOwnerBit >> 3)) != 0;
+    return (mode & (wantOwnerBit >> 6)) != 0;
 }
 
 const void* vfsFileData(VfsNode* node)
