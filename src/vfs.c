@@ -1122,15 +1122,17 @@ int64 vfsRead(int fd, void* buffer, uint64 length)
         return sfsFdRead(d, buffer, length);
 
     if (d->kind == fdConsole) {
-        char* text = (char*)buffer;
-        uint64 count = 0;
-        while (count < length) {
-            char c = keyboardReadChar();
-            text[count++] = c;
-            if (c == '\n')
-                break;
-        }
-        return (int64)count;
+        /* Non-blocking, like every other real fd kind above: -1 (queue
+           currently empty) is the "would block" signal syscall.c's sysRead
+           retries via vfsBlockingChannel's channel + the restart-syscall
+           trick, instead of this function looping/halting in place the way
+           the old single-global-buffer keyboardReadChar() used to. Returns
+           whatever is queued right now (possibly fewer than length bytes,
+           same partial-read contract pipeRead already has) rather than
+           insisting on a full line -- nothing in this kernel relied on the
+           old line-buffering behavior (grep shows no caller ever read fd 0
+           before this wave). */
+        return keyboardReaderRead(d->pipeHandle, buffer, length);
     }
 
     VfsNode* node = d->node;
@@ -1149,7 +1151,7 @@ int64 vfsRead(int fd, void* buffer, uint64 length)
 int64 vfsLseek(int fd, int64 offset, int whence)
 {
     FileDescriptor* d = fdAt(fd);
-    if (!d || d->kind != fdFile)
+    if (!d || (d->kind != fdFile && d->kind != fdBlockDev && d->kind != fdSfs))
         return -1;
 
     int64 base;
@@ -1157,9 +1159,14 @@ int64 vfsLseek(int fd, int64 offset, int whence)
         base = 0;
     else if (whence == seekCur)
         base = (int64)d->offset;
-    else if (whence == seekEnd)
-        base = (int64)d->node->size;
-    else
+    else if (whence == seekEnd) {
+        if (d->kind == fdBlockDev)
+            base = (int64)blockDevTotalBytes();
+        else if (d->kind == fdSfs)
+            base = (int64)sfsSizeOf(d->pipeHandle);
+        else
+            base = (int64)d->node->size;
+    } else
         return -1;
 
     int64 target = base + offset;
@@ -1171,20 +1178,75 @@ int64 vfsLseek(int fd, int64 offset, int whence)
 
 int vfsStat(const char* path, FbStat* out)
 {
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0)
+            return -1;
+        out->size = sfsSizeOf(inodeNum);
+        out->type = sfsTypeToFsType(sfsTypeOf(inodeNum));
+        out->mode = sfsModeOf(inodeNum);
+        out->uid = sfsUidOf(inodeNum);
+        out->gid = sfsGidOf(inodeNum);
+        out->mtime = sfsMtimeOf(inodeNum);
+        out->ctime = sfsCtimeOf(inodeNum);
+        return 0;
+    }
+
+    if (strcmp(path, blockDevPath) == 0) {
+        out->size = blockDevTotalBytes();
+        out->type = fsTypeFile;
+        out->mode = 0666;
+        out->uid = 0;
+        out->gid = 0;
+        out->mtime = 0;
+        out->ctime = 0;
+        return 0;
+    }
+
     VfsNode* node = lookupNode(path);
     if (!node)
         return -1;
     out->size = node->size;
     out->type = node->type;
-    out->mode = node->writable ? 0666 : 0444;
+    out->mode = node->mode;
+    out->uid = node->uid;
+    out->gid = node->gid;
+    out->mtime = 0;
+    out->ctime = 0;
     return 0;
 }
 
 int64 vfsGetdents(int fd, void* buffer, uint64 length)
 {
     FileDescriptor* d = fdAt(fd);
-    if (!d || d->kind != fdFile)
+    if (!d || (d->kind != fdFile && d->kind != fdSfs))
         return -1;
+
+    if (d->kind == fdSfs) {
+        if (sfsTypeOf(d->pipeHandle) != sfsTypeDir)
+            return -1;
+        FbDirent* out = (FbDirent*)buffer;
+        uint64 written = 0;
+        char name[fsNameMax];
+        uint32 type;
+        while (written + sizeof(FbDirent) <= length &&
+               sfsReaddirAt(d->pipeHandle, (uint32)d->offset, name, sizeof(name), &type)) {
+            uint64 nameLen = strlen(name);
+            out->type = sfsTypeToFsType(type);
+            out->nameLength = (unsigned int)nameLen;
+            memcpy(out->name, name, nameLen + 1);
+            out++;
+            written += sizeof(FbDirent);
+            d->offset++;
+        }
+        return (int64)written;
+    }
+
     VfsNode* node = d->node;
     if (node->type != fsTypeDir)
         return -1;
@@ -1214,27 +1276,87 @@ int64 vfsGetdents(int fd, void* buffer, uint64 length)
 
 int vfsMkdir(const char* path)
 {
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel))
+        return sfsCreateDir(rel) >= 0 ? 0 : -1;
+
     if (lookupNode(path))
         return -1;
     char leaf[fsNameMax];
     VfsNode* parent = splitParent(path, leaf, sizeof(leaf));
-    if (!parent || parent->type != fsTypeDir || !parent->writable)
+    if (!parent || parent->type != fsTypeDir || !parent->writable
+            || !vfsPermitted(parent->mode, parent->uid, parent->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
         return -1;
-    return makeChildDir(parent, leaf, strlen(leaf), true) ? 0 : -1;
+    return makeChildDir(parent, leaf, strlen(leaf), true, fsModeDefaultDir) ? 0 : -1;
 }
 
 int vfsUnlink(const char* path)
 {
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        /* Real unlink(2) semantics: EISDIR on a directory, even an empty
+           one -- rmdir(2) (vfsRmdir below) is the only sanctioned way to
+           remove one. sfsRemove itself has no opinion here (it is the raw
+           on-disk primitive, also used by vfsRmdir below), so the type
+           check has to happen at this dispatch layer, matching the tmpfs
+           branch below which has always refused a directory this way. */
+        if (inodeNum < 0 || sfsTypeOf(inodeNum) == sfsTypeDir)
+            return -1;
+        /* Only the LAST directory entry pointing at a persistent fifo's
+           inode should ever tear down its live pipe.h binding (see
+           sfsFifoForget above) -- a hardlinked fifo (sfsLink does not
+           special-case sfsTypeFifo, unlike sfsTypeDir) losing one of
+           several names must leave any live session alone, exactly like
+           sfsRemove itself only actually frees the inode once linkCount
+           drops to 0. Checked and captured BEFORE sfsRemove, since a
+           successful removal may itself free the inode (readInode on it
+           afterwards would read whatever unrelated data now occupies that
+           slot, if anything). */
+        bool lastLinkOfFifo = sfsTypeOf(inodeNum) == sfsTypeFifo &&
+                               sfsLinkCountOf(inodeNum) <= 1;
+        if (!sfsRemove(rel))
+            return -1;
+        if (lastLinkOfFifo)
+            sfsFifoForget(inodeNum);
+        return 0;
+    }
+
     VfsNode* node = lookupNode(path);
-    if (!node || node->type != fsTypeFile || !node->writable)
+    if (!node || !node->writable || (node->type != fsTypeFile && node->type != fsTypeFifo))
         return -1;
 
+    /* Real unlink(2) semantics: removing a directory ENTRY needs write
+       permission on the PARENT directory, not on the entry itself -- a
+       real Unix caller can delete a read-only file it can write into the
+       containing directory of, matching real Unix's own "the file's own
+       mode is irrelevant to unlink" rule. */
     VfsNode* parent = node->parent;
+    if (!vfsPermitted(parent->mode, parent->uid, parent->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+        return -1;
+
     VfsNode** link = &parent->firstChild;
     while (*link && *link != node)
         link = &(*link)->nextSibling;
     if (*link)
         *link = node->nextSibling;
+
+    /* Any fd already opened on this fifo (fdPipeRead/fdPipeWrite) keeps
+       working off its own copy of node->pipeHandle -- it never dereferences
+       this node again, so freeing it here does not disturb a live reader or
+       writer, matching real unlink-while-open semantics. Only reclaim the
+       underlying pipe slot if nobody ever actually opened it; otherwise the
+       still-open ends must keep it alive until their own vfsClose. */
+    if (node->type == fsTypeFifo)
+        pipeDestroyIfUnattached(node->pipeHandle);
 
     if (node->rwData)
         kfree(node->rwData);
