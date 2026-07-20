@@ -5,17 +5,51 @@
 #include "console.h"
 #include "keyboard.h"
 #include "sched.h"
+#include "pipe.h"
+#include "pidfd.h"
+#include "ata.h"
+#include "sfs.h"
+#include "poll.h"
 
 #define tmpfsBlock 512
+#define blockDevPath "/dev/disk0"
+#define sfsMountPrefix "/mnt"
+#define sfsMountPrefixLen 4
 
 struct VfsNode {
     char name[fsNameMax];
     uint32 type;
     bool writable;
+    /* Real owner rwx permission bits (fs.h's fsModeOwner*), an axis
+       independent of `writable` above: `writable` says whether this node's
+       CONTENT/CHILDREN may be mutated at all (a mount-level property, false
+       for every ustar-loaded node regardless of mode); `mode` is the real,
+       chmod(2)-settable per-node permission a caller must ALSO satisfy to
+       open the node for writing or (jobctl.c/syscall.c) exec it. Both gates
+       must pass, exactly like a real read-only mount PLUS real per-file
+       permission bits would. */
+    uint32 mode;
+    /* Real owner identity (POSIX uid, fs.h's FbStat.uid): whichever
+       currentThreadUid() was current at nodeAlloc time -- always 0 ("root")
+       for every ustar-loaded and boot-time tmpfs-mount node, since
+       vfsMountUstar/vfsMountTmpfs both run after schedInit but before any
+       real process exists (schedInit's idle thread, uid 0, is always
+       "current" then). Never retroactive, like mode's own default; there is
+       no chown-shaped call anywhere in this kernel to ever change it after
+       creation (see fs.h's FbStat.uid doc comment). */
+    uint32 uid;
+    /* Real group identity (fs.h's FbStat.gid): whichever currentThreadGid()
+       was current at nodeAlloc time, same creation-time-only, never-
+       retroactive shape as uid immediately above. */
+    uint32 gid;
     const uint8* roData;
     uint8* rwData;
     uint64 size;
     uint64 capacity;
+    /* Only meaningful for type == fsTypeFifo: the pipe.h handle every
+       vfsOpen on this path attaches a fresh end to (see makeChildFifo). -1
+       for every other node type. */
+    int32 pipeHandle;
     struct VfsNode* parent;
     struct VfsNode* firstChild;
     struct VfsNode* nextSibling;
@@ -23,7 +57,7 @@ struct VfsNode {
 
 static VfsNode* root;
 
-static VfsNode* nodeAlloc(const char* name, uint64 nameLen, uint32 type, bool writable)
+static VfsNode* nodeAlloc(const char* name, uint64 nameLen, uint32 type, bool writable, uint32 mode)
 {
     VfsNode* node = (VfsNode*)kmalloc(sizeof(VfsNode));
     if (!node)
@@ -35,6 +69,10 @@ static VfsNode* nodeAlloc(const char* name, uint64 nameLen, uint32 type, bool wr
     node->name[nameLen] = 0;
     node->type = type;
     node->writable = writable;
+    node->mode = mode;
+    node->uid = currentThreadUid();
+    node->gid = currentThreadGid();
+    node->pipeHandle = -1;
     return node;
 }
 
@@ -53,18 +91,18 @@ static VfsNode* findChild(VfsNode* parent, const char* name, uint64 nameLen)
     return nullptr;
 }
 
-static VfsNode* makeChildDir(VfsNode* parent, const char* name, uint64 nameLen, bool writable)
+static VfsNode* makeChildDir(VfsNode* parent, const char* name, uint64 nameLen, bool writable, uint32 mode)
 {
-    VfsNode* node = nodeAlloc(name, nameLen, fsTypeDir, writable);
+    VfsNode* node = nodeAlloc(name, nameLen, fsTypeDir, writable, mode);
     if (node)
         addChild(parent, node);
     return node;
 }
 
 static VfsNode* makeChildFile(VfsNode* parent, const char* name, uint64 nameLen,
-                              const uint8* data, uint64 size, bool writable)
+                              const uint8* data, uint64 size, bool writable, uint32 mode)
 {
-    VfsNode* node = nodeAlloc(name, nameLen, fsTypeFile, writable);
+    VfsNode* node = nodeAlloc(name, nameLen, fsTypeFile, writable, mode);
     if (!node)
         return nullptr;
     if (writable) {
@@ -79,6 +117,29 @@ static VfsNode* makeChildFile(VfsNode* parent, const char* name, uint64 nameLen,
     return node;
 }
 
+static VfsNode* makeChildFifo(VfsNode* parent, const char* name, uint64 nameLen, int pipeHandle)
+{
+    VfsNode* node = nodeAlloc(name, nameLen, fsTypeFifo, true, fsModeDefaultFile);
+    if (!node)
+        return nullptr;
+    node->pipeHandle = pipeHandle;
+    addChild(parent, node);
+    return node;
+}
+
+/* Real POSIX "search" permission: resolving a NAME inside a directory (as
+   opposed to "." / ".." above, which never look anything up) requires the
+   owner-or-other exec bit on that directory for the calling thread's own
+   uid, exactly like a real kernel's namei() checks X_OK on every directory
+   it walks through. Deliberately only gates the findChild() branch below,
+   not "."/".." -- an honest, minor scope boundary matching this codebase's
+   existing style of not fixing unrelated pre-existing gaps while adding a
+   new feature (see this file's many other "deliberately out of scope"
+   comments). Denial collapses to the same nullptr every other lookup
+   failure already returns, matching every other EACCES-shaped refusal in
+   this file (resolveOpen's write check, etc.) -- callers cannot tell
+   "does not exist" from "exists but not searchable", exactly like the rest
+   of this VFS layer's error handling. */
 static VfsNode* lookupNode(const char* path)
 {
     if (!path)
@@ -102,6 +163,8 @@ static VfsNode* lookupNode(const char* path)
                 cur = cur->parent;
         } else {
             if (cur->type != fsTypeDir)
+                return nullptr;
+            if (!vfsPermitted(cur->mode, cur->uid, cur->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerExec))
                 return nullptr;
             VfsNode* child = findChild(cur, start, len);
             if (!child)
@@ -191,12 +254,27 @@ static void ustarAdd(const char* rawPath, bool isDir, const uint8* data, uint64 
         if (last) {
             if (!child) {
                 if (isDir)
-                    child = makeChildDir(cur, path + start, len, false);
-                else
-                    child = makeChildFile(cur, path + start, len, data, size, false);
+                    child = makeChildDir(cur, path + start, len, false, fsModeDefaultDir);
+                else {
+                    /* Anything shipped under "bin/" (mktar's own stored-name
+                       convention, no leading slash -- see tools/mktar.c) is a
+                       real binary this kernel spawns by path (jobctlSpawn,
+                       syscall.c's loadImageByPath): give it the owner-exec
+                       bit by default, exactly as if someone had already run
+                       `chmod 755` on it, since nothing in this kernel could
+                       otherwise ever chmod a read-only ustar-loaded file
+                       (vfsChmod refuses a non-writable node, same as every
+                       other tmpfs mutation). Everything else defaults to
+                       fsModeDefaultFile (no exec bit), matching a real
+                       ordinary shipped data file. */
+                    uint32 mode = (n > 4 && memcmp(path, "bin/", 4) == 0)
+                                      ? fsModeDefaultExec
+                                      : fsModeDefaultFile;
+                    child = makeChildFile(cur, path + start, len, data, size, false, mode);
+                }
             }
         } else if (!child) {
-            child = makeChildDir(cur, path + start, len, false);
+            child = makeChildDir(cur, path + start, len, false, fsModeDefaultDir);
         }
         if (!child)
             return;
@@ -206,7 +284,7 @@ static void ustarAdd(const char* rawPath, bool isDir, const uint8* data, uint64 
 
 void vfsInit(void)
 {
-    root = nodeAlloc("/", 1, fsTypeDir, false);
+    root = nodeAlloc("/", 1, fsTypeDir, false, fsModeDefaultDir);
 }
 
 void vfsMountUstar(uint64 start, uint64 end)
@@ -233,7 +311,7 @@ void vfsMountTmpfs(const char* path)
         return;
     if (findChild(parent, leaf, strlen(leaf)))
         return;
-    makeChildDir(parent, leaf, strlen(leaf), true);
+    makeChildDir(parent, leaf, strlen(leaf), true, fsModeDefaultDir);
     kprintf("[vfs]  mounted writable tmpfs at %s\n", path);
 }
 
@@ -244,10 +322,25 @@ void vfsFdInit(FileDescriptor* fds)
         fds[i].offset = 0;
         fds[i].kind = fdFree;
         fds[i].flags = 0;
+        fds[i].pipeHandle = -1;
     }
     fds[0].kind = fdConsole;
     fds[1].kind = fdConsole;
     fds[2].kind = fdConsole;
+
+    /* fd 0's own console reader queue (keyboard.h) -- reused field, same as
+       a pipe/fifo fd's handle into pipe.c's table. Every thread (kernel and
+       user alike) gets one, whether it ever reads stdin or not, matching
+       fd 0 already always being fdConsole for every thread regardless of
+       use. fdFlagBlocking makes syscall.c's sysRead retry-syscall path
+       treat it exactly like a blocking pipe end (vfsBlockingChannel below);
+       fd 1/2 (stdout/stderr) never read, so they get no reader and no
+       blocking flag. If the reader table is exhausted, fd 0 is left
+       non-blocking with an invalid handle -- reads on it then simply fail
+       (-1) rather than crash, the same fail-open behavior a fully exhausted
+       pipe/fifo table already has elsewhere in this file. */
+    fds[0].pipeHandle = keyboardOpenReader();
+    fds[0].flags = fdFlagBlocking;
 }
 
 static FileDescriptor* fdAt(int fd)
@@ -286,8 +379,354 @@ static bool ensureCapacity(VfsNode* node, uint64 needed)
     return true;
 }
 
-int vfsOpen(const char* path, uint32 flags)
+static uint64 blockDevTotalBytes(void)
 {
+    return ataSectorCount() * (uint64)ataSectorSize;
+}
+
+/* Reads/writes at most one sector's worth per iteration so a request that
+   straddles a sector boundary (or several) is handled as a sequence of
+   aligned sector transfers, each preceded by a read-modify-write step when
+   the access does not start or end on a sector boundary. */
+static int64 blockDevRead(FileDescriptor* d, void* buffer, uint64 length)
+{
+    uint64 total = blockDevTotalBytes();
+    if (d->offset >= total)
+        return 0;
+    uint64 want = length;
+    if (want > total - d->offset)
+        want = total - d->offset;
+
+    uint8* dst = (uint8*)buffer;
+    uint64 done = 0;
+    while (done < want) {
+        uint64 offset = d->offset + done;
+        uint64 lba = offset / ataSectorSize;
+        uint64 within = offset % ataSectorSize;
+        uint64 chunk = ataSectorSize - within;
+        if (chunk > want - done)
+            chunk = want - done;
+
+        uint8 sector[ataSectorSize];
+        if (!ataReadSectors(lba, 1, sector))
+            break;
+        memcpy(dst + done, sector + within, chunk);
+        done += chunk;
+    }
+
+    d->offset += done;
+    if (done > 0)
+        return (int64)done;
+    return want == 0 ? 0 : -1;
+}
+
+static int64 blockDevWrite(FileDescriptor* d, const void* buffer, uint64 length)
+{
+    uint64 total = blockDevTotalBytes();
+    if (d->offset >= total)
+        return -1;
+    uint64 want = length;
+    if (want > total - d->offset)
+        want = total - d->offset;
+
+    const uint8* src = (const uint8*)buffer;
+    uint64 done = 0;
+    while (done < want) {
+        uint64 offset = d->offset + done;
+        uint64 lba = offset / ataSectorSize;
+        uint64 within = offset % ataSectorSize;
+        uint64 chunk = ataSectorSize - within;
+        if (chunk > want - done)
+            chunk = want - done;
+
+        uint8 sector[ataSectorSize];
+        if (chunk == ataSectorSize) {
+            memcpy(sector, src + done, ataSectorSize);
+        } else if (!ataReadSectors(lba, 1, sector)) {
+            break;
+        } else {
+            memcpy(sector + within, src + done, chunk);
+        }
+        if (!ataWriteSectors(lba, 1, sector))
+            break;
+        done += chunk;
+    }
+
+    d->offset += done;
+    if (done > 0)
+        return (int64)done;
+    return want == 0 ? 0 : -1;
+}
+
+/* True for "/mnt" itself and for anything under "/mnt/". relOut receives the
+   path with the prefix stripped: "" (or "/foo") for sfsLookup, which treats
+   an empty relative path as the sfs root. */
+static bool isSfsPath(const char* path, const char** relOut)
+{
+    if (strncmp(path, sfsMountPrefix, sfsMountPrefixLen) != 0)
+        return false;
+    char after = path[sfsMountPrefixLen];
+    if (after != '\0' && after != '/')
+        return false;
+    *relOut = path + sfsMountPrefixLen;
+    return true;
+}
+
+/* See vfs.h's own doc comment for the full contract -- this is the single
+   place shell.c's old per-builtin static cwd's logic now lives, shared by
+   every path-taking entry point below instead of only shell.c's own
+   handful of commands. */
+void vfsResolvePath(const char* path, char* out, uint64 cap)
+{
+    if (path[0] == '/') {
+        uint64 len = strlen(path);
+        if (len >= cap)
+            len = cap - 1;
+        memcpy(out, path, len);
+        out[len] = 0;
+        return;
+    }
+
+    const char* cwd = currentThreadCwd();
+    uint64 pos = strlen(cwd);
+    if (pos >= cap)
+        pos = cap - 1;
+    memcpy(out, cwd, pos);
+    if (pos == 0 || out[pos - 1] != '/') {
+        if (pos < cap - 1)
+            out[pos++] = '/';
+    }
+    uint64 i = 0;
+    while (path[i] && pos < cap - 1)
+        out[pos++] = path[i++];
+    out[pos] = 0;
+}
+
+static uint32 sfsTypeToFsType(uint32 sfsType)
+{
+    if (sfsType == sfsTypeDir)
+        return fsTypeDir;
+    if (sfsType == sfsTypeFifo)
+        return fsTypeFifo;
+    return fsTypeFile;
+}
+
+/* Persistent (sfs.h) named-pipe bindings for "/mnt" fifos: sfs.c stores only
+   that a path IS a fifo (the inode's type), never a live byte stream -- the
+   actual pipe.h handle carrying bytes between two independent openers of
+   the same persistent path is purely in-memory here, exactly like the
+   VfsNode-resident one a tmpfs fifo carries on its own node forever (see
+   makeChildFifo above), except an SFS inode number has nowhere on-disk to
+   remember a handle. This small fixed table maps inode number -> live
+   handle, created lazily on the FIRST open() of either direction (or the
+   first open() since every previous session's ends have both gone away,
+   see sfsFifoForget) and reused by every later open() of the same inode
+   until then.
+   Slot 0 is never a real fifo inode (allocInodeNum, sfs.c, starts at 1;
+   inode 0 is permanently marked used by sfsFormat as a sentinel), so a
+   zero-initialized table already starts every slot correctly "free" --
+   inodeNum 0 doubles as "empty slot" the same way pipeHandle -1 already
+   means "no handle" everywhere else in this file.
+   Two INDEPENDENT staleness checks guard against two INDEPENDENT ways a
+   remembered (inodeNum, handle) pair can stop meaning what it used to:
+     - sfsGeneration() (sfs.h) catches "the whole filesystem underneath was
+       wiped since" -- every sfsTest.c test starts with its own sfsFormat()
+       call, which reuses inode numbers for completely unrelated entries
+       dozens of times a boot; without this check, a binding left over from
+       a wiped filesystem could silently hand a brand-new, unrelated
+       inode's opener the OLD fifo's (possibly still-leaked) handle.
+     - pipeIncarnation(handle) (pipe.h) catches "pipe.c's own table recycled
+       this NUMBER for an unrelated pipe since" -- an entirely ordinary
+       event that needs no filesystem format at all: the moment BOTH ends
+       of a completed fifo round-trip close, pipeReleaseIfUnused frees the
+       slot back to the general pool, and the very next unrelated
+       vfsPipe()/vfsMkfifo() anywhere in the kernel is free to claim that
+       exact number for something else entirely. pipeValid(handle) alone
+       cannot tell "still my pipe, nobody has closed it" apart from
+       "already reused by a stranger" -- only the incarnation counter can.
+   Either mismatch is treated exactly like "never bound": the stale slot is
+   evicted -- WITHOUT touching pipe.c, since whatever handle number it
+   remembers may already mean something else by now -- and a fresh handle
+   is created as if this were the first open ever. */
+#define maxSfsFifoBindings 8
+
+typedef struct SfsFifoBinding {
+    int32 inodeNum;
+    int32 pipeHandle;
+    uint32 incarnation;
+    uint64 generation;
+} SfsFifoBinding;
+
+static SfsFifoBinding sfsFifoBindings[maxSfsFifoBindings];
+
+/* Finds inodeNum's live binding, discarding it first if it is stale by
+   either check above. Returns nullptr if there is no valid binding (never
+   bound, or just evicted as stale). */
+static SfsFifoBinding* sfsFifoFind(int32 inodeNum)
+{
+    uint64 gen = sfsGeneration();
+    for (uint32 i = 0; i < maxSfsFifoBindings; i++) {
+        SfsFifoBinding* b = &sfsFifoBindings[i];
+        if (b->inodeNum != inodeNum)
+            continue;
+        if (b->generation != gen || pipeIncarnation(b->pipeHandle) != b->incarnation) {
+            b->inodeNum = 0;
+            return nullptr;
+        }
+        return b;
+    }
+    return nullptr;
+}
+
+/* Returns inodeNum's live pipe handle, creating a fresh pipeCreateDetached
+   one (and a new table slot) the first time this inode is opened since the
+   last time nobody had it open -- exactly the "nobody attached yet, keep
+   retrying rather than report broken/EOF" contract pipeCreateDetached
+   itself already documents. -1 if pipe.c's own table is exhausted, or this
+   inode has no existing binding and the (much smaller) binding table above
+   is itself full. */
+static int32 sfsFifoHandleFor(int32 inodeNum)
+{
+    SfsFifoBinding* existing = sfsFifoFind(inodeNum);
+    if (existing)
+        return existing->pipeHandle;
+
+    int handle = pipeCreateDetached();
+    if (handle < 0)
+        return -1;
+
+    for (uint32 i = 0; i < maxSfsFifoBindings; i++) {
+        if (sfsFifoBindings[i].inodeNum == 0) {
+            sfsFifoBindings[i].inodeNum = inodeNum;
+            sfsFifoBindings[i].pipeHandle = handle;
+            sfsFifoBindings[i].incarnation = pipeIncarnation(handle);
+            sfsFifoBindings[i].generation = sfsGeneration();
+            return handle;
+        }
+    }
+    pipeDestroyIfUnattached(handle);
+    return -1;
+}
+
+/* Called when inodeNum's own directory entry is actually gone for good
+   (sfsRemove reached the last link, see vfsUnlink) -- evicts the table slot
+   FIRST, then attempts pipeDestroyIfUnattached on the handle it held:
+   unlinking a fifo that is currently open must leave the still-open ends
+   alone (they keep working off their own copy of the handle number,
+   matching the tmpfs fifo's own vfsUnlink comment below), so the destroy is
+   a no-op unless nobody ever attached to it. Evicting before destroying
+   (rather than after) closes the narrow window where a concurrent opener
+   of the SAME inode number could otherwise see the stale slot as still
+   valid and attach to a handle number pipe.c is about to hand out to
+   something completely unrelated. */
+static void sfsFifoForget(int32 inodeNum)
+{
+    for (uint32 i = 0; i < maxSfsFifoBindings; i++) {
+        if (sfsFifoBindings[i].inodeNum == inodeNum) {
+            int handle = sfsFifoBindings[i].pipeHandle;
+            sfsFifoBindings[i].inodeNum = 0;
+            pipeDestroyIfUnattached(handle);
+            return;
+        }
+    }
+}
+
+static int64 sfsFdRead(FileDescriptor* d, void* buffer, uint64 length)
+{
+    int64 got = sfsReadAt(d->pipeHandle, d->offset, buffer, length);
+    if (got > 0)
+        d->offset += (uint64)got;
+    return got;
+}
+
+static int64 sfsFdWrite(FileDescriptor* d, const void* buffer, uint64 length)
+{
+    int64 written = sfsWriteAt(d->pipeHandle, d->offset, buffer, length);
+    if (written > 0)
+        d->offset += (uint64)written;
+    return written;
+}
+
+int vfsMkfifo(const char* path)
+{
+    char resolvedPath[fsPathMax];
+    vfsResolvePath(path, resolvedPath, sizeof(resolvedPath));
+    path = resolvedPath;
+
+    const char* rel;
+    /* Persistent named pipe (sfs.h's sfsTypeFifo): only the directory entry
+       and its type are created here -- the live pipe.h handle two openers
+       actually rendezvous over is created lazily by vfsOpen the first time
+       anyone opens it (sfsFifoHandleFor above), the same "create on first
+       real use" split every other SFS-backed thing keeps between "what is
+       on disk" (sfs.c, no pipe.h dependency at all) and "what is live in
+       this boot's memory" (here). */
+    if (isSfsPath(path, &rel))
+        return sfsCreateFifo(rel) >= 0 ? 0 : -1;
+    if (strcmp(path, blockDevPath) == 0)
+        return -1;
+    if (lookupNode(path))
+        return -1;
+
+    char leaf[fsNameMax];
+    VfsNode* parent = splitParent(path, leaf, sizeof(leaf));
+    if (!parent || parent->type != fsTypeDir || !parent->writable
+            || !vfsPermitted(parent->mode, parent->uid, parent->gid, currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
+        return -1;
+
+    int handle = pipeCreateDetached();
+    if (handle < 0)
+        return -1;
+
+    if (!makeChildFifo(parent, leaf, strlen(leaf), handle)) {
+        pipeDestroyIfUnattached(handle);
+        return -1;
+    }
+    return 0;
+}
+
+/* Shared core of vfsOpen/vfsOpenInto below: resolves `path`+`flags` and, on
+   success, fills EVERY field of `d` (whichever FileDescriptor the caller
+   decided on -- a freshly allocated slot in the calling thread's own table
+   for vfsOpen, or an explicit slot in some other, not-yet-running thread's
+   table for vfsOpenInto) and returns 0. On failure, returns -1 having
+   written NOTHING to `d` at all -- every early return below is before the
+   first store into `d`, so a caller never has to clean up a half-written
+   descriptor. */
+static int resolveOpen(FileDescriptor* d, const char* path, uint32 flags)
+{
+    const char* rel;
+    if (isSfsPath(path, &rel)) {
+        int32 inodeNum = sfsLookup(rel);
+        if (inodeNum < 0) {
+            if (!(flags & oCreate))
+                return -1;
+            inodeNum = sfsCreateFile(rel);
+            if (inodeNum < 0)
+                return -1;
+        } else if (sfsTypeOf(inodeNum) == sfsTypeFifo) {
+            /* One-directional only, exactly like the tmpfs fifo branch
+               below and vfsPipeAttach's wantWrite bool -- a real O_RDWR
+               fifo fd has no equivalent here, since a single fd can only be
+               fdPipeRead or fdPipeWrite, never both. */
+            uint32 mode = flags & (oWriteOnly | oReadWrite);
+            bool wantWrite;
+            if (mode == oWriteOnly)
+                wantWrite = true;
+            else if (mode == oReadOnly)
+                wantWrite = false;
+            else
+                return -1;
+
+            int handle = sfsFifoHandleFor(inodeNum);
+            if (handle < 0)
+                return -1;
+
+            d->node = nullptr;
+            d->offset = 0;
+            d->kind = wantWrite ? fdPipeWrite : fdPipeRead;
+            d->flags = fdFlagBlocking;
+            d->pipeHandle = handle;
     VfsNode* node = lookupNode(path);
     if (!node) {
         if (!(flags & oCreate))

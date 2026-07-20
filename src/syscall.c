@@ -298,9 +298,25 @@ uint64 syscallDispatch(Registers* regs)
         }
         regs->rax = (uint64)result;
         return (uint64)regs;
-    case sysRead:
-        regs->rax = (uint64)doRead(regs->rdi, regs->rsi, regs->rdx);
+    }
+    case sysRead: {
+        int64 result = doRead(regs->rdi, regs->rsi, regs->rdx);
+        if (result == -1) {
+            /* Covers a fdFlagBlocking pipe/fifo end (see sysWrite above) and
+               fd 0's console reader queue (keyboard.h) alike -- both report
+               "would block" as -1 from doRead, and vfsBlockingChannel picks
+               the right wait channel for whichever kind fd actually is. */
+            const void* channel = vfsBlockingChannel((int)regs->rdi, false);
+            if (channel) {
+                currentThread()->sigInRetryableSyscall = true;
+                schedBlockCurrent(channel);
+                regs->rip -= 2;
+                return schedule((uint64)regs);
+            }
+        }
+        regs->rax = (uint64)result;
         return (uint64)regs;
+    }
     case sysGetpid:
         regs->rax = currentThreadId();
         return (uint64)regs;
@@ -358,6 +374,68 @@ uint64 syscallDispatch(Registers* regs)
             regs->rax = (uint64)(int64)vfsMkdir(path);
         return (uint64)regs;
     }
+    case sysChdir: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsChdir(path);
+        return (uint64)regs;
+    }
+    case sysGetcwd:
+        if (!userRangeOk(regs->rdi, regs->rsi))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)vfsGetcwd((char*)regs->rdi, regs->rsi);
+        return (uint64)regs;
+    case sysGetEnv: {
+        char name[envEntryMax];
+        if (!copyUserPath(regs->rdi, name, sizeof(name)) || !userRangeOk(regs->rsi, regs->rdx)) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        const char* value = currentThreadGetEnv(name);
+        if (!value) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        uint64 len = strlen(value);
+        if (len >= regs->rdx) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        memcpy((void*)regs->rsi, value, len + 1);
+        regs->rax = (uint64)len;
+        return (uint64)regs;
+    }
+    case sysSetEnv: {
+        char name[envEntryMax];
+        char value[envEntryMax];
+        if (!copyUserPath(regs->rdi, name, sizeof(name)) ||
+            !copyUserPath(regs->rsi, value, sizeof(value))) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        regs->rax = currentThreadSetEnv(name, value) ? 0 : (uint64)-1;
+        return (uint64)regs;
+    }
+    case sysUnsetEnv: {
+        /* Real unsetenv(3): a no-op success whether or not `name` actually
+           had an entry -- ONLY a bad user pointer/path is a real failure
+           here, unlike sysSetEnv above where "table full"/"too long" are
+           genuine failures. currentThreadUnsetEnv's own bool return (which
+           DOES distinguish "removed" from "was not there", for a kernel-
+           side caller like shell.c that might want to) is deliberately
+           discarded at this syscall boundary. */
+        char name[envEntryMax];
+        if (!copyUserPath(regs->rdi, name, sizeof(name))) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        currentThreadUnsetEnv(name);
+        regs->rax = 0;
+        return (uint64)regs;
+    }
     case sysUnlink: {
         char path[256];
         if (!copyUserPath(regs->rdi, path, sizeof(path)))
@@ -366,6 +444,526 @@ uint64 syscallDispatch(Registers* regs)
             regs->rax = (uint64)(int64)vfsUnlink(path);
         return (uint64)regs;
     }
+    case sysRmdir: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsRmdir(path);
+        return (uint64)regs;
+    }
+    case sysChmod: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsChmod(path, (uint32)regs->rsi);
+        return (uint64)regs;
+    }
+    case sysChown: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsChown(path, (uint32)regs->rsi);
+        return (uint64)regs;
+    }
+    case sysGetuid:
+        /* Real getuid(2): no arguments, always succeeds, straight through
+           to the calling thread's own credential. */
+        regs->rax = (uint64)currentThreadUid();
+        return (uint64)regs;
+    case sysSetuid:
+        /* Real setuid(2): currentThreadSetUid (sched.h) itself enforces the
+           actual privilege rule (uid 0 may become anyone; anyone else may
+           only pass their own current uid back in) -- this dispatch case
+           does no additional validation of its own, matching sysChdir's own
+           "the underlying function already checks everything" split. */
+        regs->rax = currentThreadSetUid((uint32)regs->rdi) ? 0 : (uint64)-1;
+        return (uint64)regs;
+    case sysGetgid:
+        /* Real getgid(2): same shape as sysGetuid above. */
+        regs->rax = (uint64)currentThreadGid();
+        return (uint64)regs;
+    case sysSetgid:
+        /* Real setgid(2): currentThreadSetGid (sched.h) itself enforces the
+           actual privilege rule (gated by this thread's own UID, not GID --
+           see that function's own doc comment). */
+        regs->rax = currentThreadSetGid((uint32)regs->rdi) ? 0 : (uint64)-1;
+        return (uint64)regs;
+    case sysChgrp: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsChgrp(path, (uint32)regs->rsi);
+        return (uint64)regs;
+    }
+    case sysPidfdOpen:
+        /* vfsPidfdOpen (vfs.c) already does every validity check pidfd.h's
+           own pidfdOpen needs (id 0/out-of-range/already-unused target) and
+           the fd-table installation vfsPipe/vfsPipeAttach's own dispatch
+           cases above delegate the same way -- nothing left for this
+           handler to add. */
+        regs->rax = (uint64)vfsPidfdOpen((uint32)regs->rdi);
+        return (uint64)regs;
+    case sysPidfdSend: {
+        /* vfsPidfdTarget folds "is this fd even a live pidfd" and "has the
+           original target since been reaped/recycled" (pidfd.h's own
+           generation check) into one call -- a stale handle is rejected
+           right here, before sigRaiseInfo ever sees a pid, which is
+           exactly the ABA-safety pidfd.h exists to provide over a raw
+           userSigSend(pid, signum) on a cached pid (see pidfd.h's own file
+           comment). Otherwise identical to sysSigSend's own single-target
+           path just above (same siCodeUser/senderPid convention, same
+           sigKill/sigStop bypasses already living inside sigRaiseInfo). */
+        uint32 target = vfsPidfdTarget((int)regs->rdi);
+        if (target == threadInvalidId) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        int signum = (int)regs->rsi;
+        bool ok = sigRaiseInfo(target, signum, siCodeUser, (int)currentThreadId(), 0);
+        regs->rax = ok ? 0 : (uint64)-1;
+        return (uint64)regs;
+    }
+    case sysPidfdWait: {
+        /* Same retry-the-syscall park pattern as sysWait's own specific-pid
+           path below, just resolving the target through a pidfd instead of
+           a raw pid -- re-resolved on EVERY retry (not just the first
+           check), so a target that gets reaped by someone else while this
+           thread is blocked is caught the instant this thread wakes back
+           up, rather than only at the moment sysPidfdWait was first called.
+           threadJoin(target) below only ever reaps a thread this exact
+           check just proved is threadDead AND still the same incarnation
+           this handle was opened on, so there is no risk of it silently
+           reaping (or reporting the exit code of) an unrelated thread that
+           happens to have landed on the same numeric slot since. */
+        uint32 target = vfsPidfdTarget((int)regs->rdi);
+        if (target == threadInvalidId) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        Thread* targetThread = threadAt(target);
+        if (targetThread->state != threadDead) {
+            currentThread()->sigInRetryableSyscall = true;
+            schedBlockCurrent(targetThread);
+            regs->rip -= 2;
+            return schedule((uint64)regs);
+        }
+        regs->rax = (uint64)threadJoin(target);
+        return (uint64)regs;
+    }
+    case sysSymlink: {
+        char target[256];
+        char path[256];
+        if (!copyUserPath(regs->rdi, target, sizeof(target)) ||
+            !copyUserPath(regs->rsi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsSymlink(path, target);
+        return (uint64)regs;
+    }
+    case sysReadlink: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)) || !userRangeOk(regs->rsi, regs->rdx))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)vfsReadlink(path, (char*)regs->rsi, regs->rdx);
+        return (uint64)regs;
+    }
+    case sysLink: {
+        char oldPath[256];
+        char newPath[256];
+        if (!copyUserPath(regs->rdi, oldPath, sizeof(oldPath)) ||
+            !copyUserPath(regs->rsi, newPath, sizeof(newPath)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsLink(oldPath, newPath);
+        return (uint64)regs;
+    }
+    case sysPipe: {
+        if (!userRangeOk(regs->rdi, 2 * sizeof(int))) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        int* userFds = (int*)regs->rdi;
+        int readFd, writeFd;
+        if (vfsPipe(&readFd, &writeFd) < 0) {
+            regs->rax = (uint64)-1;
+        } else {
+            userFds[0] = readFd;
+            userFds[1] = writeFd;
+            regs->rax = 0;
+        }
+        return (uint64)regs;
+    }
+    case sysPipeCreate:
+        regs->rax = (uint64)vfsPipeCreateHandle();
+        return (uint64)regs;
+    case sysPipeAttach:
+        regs->rax = (uint64)vfsPipeAttach((int)regs->rdi, regs->rsi != 0);
+        return (uint64)regs;
+    case sysKill: {
+        /* Real kill(2)'s own pid<0/pid==0 convention (userKill's `pid` is
+           already a signed `long`, see ulib.h -- only this kernel-side
+           interpretation of the raw bit pattern was missing): pid>0 is the
+           single-target path this always had; pid==0 targets the caller's
+           OWN process group (threadKillGroup, sched.c -- naturally kills
+           no one else if this is the group's only OTHER member, since
+           threadKill itself already excludes the caller's own Running
+           thread); pid<0 targets group -pid, exactly like real
+           kill(-pgid, SIGKILL). */
+        int64 rawPid = (int64)regs->rdi;
+        bool ok;
+        if (rawPid > 0)
+            ok = threadKill((uint32)rawPid);
+        else
+            ok = threadKillGroup(rawPid == 0 ? currentThread()->pgid : (uint32)(-rawPid));
+        regs->rax = ok ? 0 : (uint64)-1;
+        return (uint64)regs;
+    }
+    case sysSigSend: {
+        /* Same pid>0/pid==0/pid<0 convention as sysKill just above, this
+           time through sigRaiseGroup (signal.h) for the two group cases --
+           see that function's own doc comment for why every per-target
+           special case (SIGKILL/SIGSTOP/SIGCONT bypasses, early-wake,
+           SigInfo) still applies exactly as it already does for a plain,
+           single-target send. */
+        int64 rawPid = (int64)regs->rdi;
+        int signum = (int)regs->rsi;
+        uint32 senderPid = currentThreadId();
+        bool isGroup = (rawPid <= 0);
+        uint32 targetPgid = isGroup ? (rawPid == 0 ? currentThread()->pgid : (uint32)(-rawPid)) : 0;
+
+        /* siCodeUser/senderPid: a real userSigSend always has a genuine
+           sending process, unlike sched.c's own kernel-internal raises
+           (SIGALRM/SIGCHLD) or keyboard.c's terminal-generated ones --
+           exactly real Unix's own SI_USER, si_pid the caller's own pid,
+           exactly like real kill(2). */
+        bool ok = isGroup
+            ? sigRaiseGroup(targetPgid, signum, siCodeUser, (int)senderPid)
+            : sigRaiseInfo((uint32)rawPid, signum, siCodeUser, (int)senderPid, 0);
+        regs->rax = ok ? 0 : (uint64)-1;
+
+        /* Every OTHER outcome of sigRaise/sigRaiseGroup either changes
+           nothing about the CALLING thread's own state (a signal aimed at
+           someone else) or, for an ordinary catchable signal aimed at
+           self, is already caught by isrDispatch's unconditional
+           deliverPendingSignals call right after this handler returns
+           (see isr.c) -- self-signaling sigUsr1 and having its handler
+           fire before ever reaching userspace again already works today
+           without any special case here. SIGSTOP against the caller's own
+           pid (or a group that includes it) is the one exception:
+           threadStop (called from sigRaise above, once per group member
+           for the group case) already flipped this very thread's state
+           away from Running, but sigRaise/sysSigSend never touch
+           sigPending for it (see signal.h), so deliverPendingSignals'
+           pending-bit scan would find nothing and simply hand `regs`
+           straight back -- returning to ring 3 and continuing to run a
+           thread the scheduler no longer considers Runnable, until the
+           next timer tick eventually notices. Explicit reschedule here
+           closes that gap, the same "flip state, then let schedule() do
+           the actual waiting" pattern sysSleep/sysExit already use for
+           their own self-directed state changes. The group case checks
+           targetPgid against the caller's OWN pgid rather than an exact id
+           match, since the caller itself -- not just some other member --
+           is who this reschedule is actually about. */
+        bool selfTargeted = isGroup ? (targetPgid == currentThread()->pgid) : ((uint32)rawPid == senderPid);
+        if (ok && signum == sigStop && selfTargeted)
+            return schedule((uint64)regs);
+        return (uint64)regs;
+    }
+    case sysSigAction:
+        regs->rax = sigSetHandler(currentThread(), (int)regs->rdi, regs->rsi, regs->rdx, regs->r10);
+        return (uint64)regs;
+    case sysSigProcMask:
+        regs->rax = sigProcMask(currentThread(), (int)regs->rdi, regs->rsi);
+        return (uint64)regs;
+    case sysSigReturn:
+        sigOnSigReturn(currentThread(), regs);
+        return (uint64)regs;
+    case sysAlarm:
+        regs->rax = threadSetAlarm(regs->rdi);
+        return (uint64)regs;
+    case sysSetpgid: {
+        /* Real setpgid(2)'s own "0 means self"/"0 means use pid itself as
+           the new group id" resolution -- threadSetPgid (sched.h) takes an
+           already-fully-resolved value, exactly like threadSetBrk/
+           threadSetAlarm above do for THEIR raw syscall arguments. */
+        uint32 pid = (regs->rdi == 0) ? currentThreadId() : (uint32)regs->rdi;
+        uint32 pgid = (regs->rsi == 0) ? pid : (uint32)regs->rsi;
+        regs->rax = threadSetPgid(pid, pgid) ? 0 : (uint64)-1;
+        return (uint64)regs;
+    }
+    case sysGetpgid: {
+        uint32 pid = (regs->rdi == 0) ? currentThreadId() : (uint32)regs->rdi;
+        uint32 pgid = threadPgid(pid);
+        regs->rax = (pgid == threadInvalidId) ? (uint64)-1 : (uint64)pgid;
+        return (uint64)regs;
+    }
+    case sysNice: {
+        /* Real setpriority(PRIO_PROCESS, ...)'s own "0 means the caller
+           itself" convention, same resolution shape as sysSetpgid's `pid`
+           argument just above -- rdi/pid, rsi/weight, straight through to
+           threadSetPriority (sched.h), which now does the SAME id==0/
+           out-of-range/Dead-or-Unused rejection threadSetPgid already did
+           (see that function's own updated doc comment for why it had to
+           catch up once this syscall made it reachable from ring 3). */
+        uint32 pid = (regs->rdi == 0) ? currentThreadId() : (uint32)regs->rdi;
+        uint32 weight = (uint32)regs->rsi;
+        regs->rax = threadSetPriority(pid, weight) ? 0 : (uint64)-1;
+        return (uint64)regs;
+    }
+    case sysGetPriority: {
+        uint32 pid = (regs->rdi == 0) ? currentThreadId() : (uint32)regs->rdi;
+        uint32 weight = threadPriority(pid);
+        regs->rax = (weight == 0) ? (uint64)-1 : (uint64)weight;
+        return (uint64)regs;
+    }
+    case sysTime:
+        /* Real time(2)'s job: seconds since the Unix epoch, off the real
+           CMOS RTC (rtc.c) -- the first syscall in this kernel answering
+           "what day is it" instead of "how long since boot" (sysSleep,
+           userAlarm). No arguments, nothing to validate. */
+        regs->rax = (uint64)rtcNow();
+        return (uint64)regs;
+    case sysSetFgPgrp:
+        /* Real tcsetpgrp(3)'s job -- names which process group keyboard.c's
+           real Ctrl-C/Ctrl-Z (SIGINT/SIGTSTP) is scoped to next. No
+           permission check at all (this kernel has no notion of "the
+           controlling terminal of MY session" to check ownership against,
+           the same honest, documented omission threadSetPgid's own doc
+           comment already gives for setpgid's session check) -- any
+           process can claim the foreground for any pgid, including one it
+           is not even a member of. */
+        keyboardSetForegroundPgid((uint32)regs->rdi);
+        regs->rax = 0;
+        return (uint64)regs;
+    case sysGetFgPgrp:
+        regs->rax = (uint64)keyboardForegroundPgid();
+        return (uint64)regs;
+    case sysPoll: {
+        /* Real poll(2): rdi/PollFd array, rsi/nfds, rdx/timeoutMs (signed,
+           -1 = wait forever, 0 = report current readiness without ever
+           blocking, like every real poll(2) implementation). Flat address
+           space (this kernel's honest fork()-less design, see doSpawn's own
+           comment) means the array can be read and written in place, the
+           same way sysStat writes straight into its caller's FbStat*
+           without a separate copy-out step. */
+        uint64 nfds = regs->rsi;
+        int64 timeoutMs = (int64)regs->rdx;
+        if (nfds > maxPollFds || !userRangeOk(regs->rdi, nfds * sizeof(PollFd))) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        PollFd* userFds = (PollFd*)regs->rdi;
+        Thread* self = currentThread();
+
+        /* First entry into this call (not a retry re-executing after a
+           park below) picks the deadline once and remembers it in
+           pollDeadline -- a later retry must NOT recompute it from the
+           still-unchanged rdx, or a poll that keeps almost-but-not-quite
+           finding a ready fd could have its effective timeout pushed out
+           indefinitely instead of counting down real elapsed time. */
+        if (!self->pollActive && timeoutMs != 0) {
+            self->pollActive = true;
+            if (timeoutMs < 0) {
+                self->pollDeadline = 0;
+            } else {
+                uint64 ticks = ((uint64)timeoutMs * (uint64)pitFrequency()) / 1000;
+                if (ticks == 0)
+                    ticks = 1;
+                self->pollDeadline = pitTicks() + ticks;
+            }
+        }
+
+        int64 ready = 0;
+        for (uint64 i = 0; i < nfds; i++) {
+            int16 revents = 0;
+            if (vfsPollReady(userFds[i].fd, userFds[i].events, &revents))
+                ready++;
+            userFds[i].revents = revents;
+        }
+
+        bool expired = self->pollActive && self->pollDeadline != 0 &&
+                       pitTicks() >= self->pollDeadline;
+        if (ready > 0 || timeoutMs == 0 || expired) {
+            self->pollActive = false;
+            self->pollDeadline = 0;
+            regs->rax = (uint64)ready;
+            return (uint64)regs;
+        }
+
+        /* None ready yet, timeout not yet reached: park on the one shared
+           channel every poller blocks on (schedPollChannel, sched.h) and
+           rewind rip so the whole syscall re-executes -- the same
+           restart-the-syscall trick sysRead/sysWrite/sysWait already use,
+           except schedule()'s own expiry scan (sched.c) is what guarantees
+           this retry eventually happens even if no fd ever becomes ready. */
+        self->sigInRetryableSyscall = true;
+        schedBlockCurrent(schedPollChannel());
+        regs->rip -= 2;
+        return schedule((uint64)regs);
+    }
+    case sysMkfifo: {
+        char path[256];
+        if (!copyUserPath(regs->rdi, path, sizeof(path)))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)(int64)vfsMkfifo(path);
+        return (uint64)regs;
+    }
+    case sysExec: {
+        char path[256];
+        char argvStorage[elfMaxArgs][execArgMaxLen];
+        const char* argvPtrs[elfMaxArgs];
+        int argc;
+        if (!copyUserPath(regs->rdi, path, sizeof(path)) ||
+            !copyUserArgv(regs->rsi, argvStorage, argvPtrs, &argc) ||
+            !doExec(path, argvPtrs, argc, regs))
+            regs->rax = (uint64)-1;
+        return (uint64)regs;
+    }
+    case sysSpawn: {
+        char path[256];
+        char argvStorage[elfMaxArgs][execArgMaxLen];
+        const char* argvPtrs[elfMaxArgs];
+        int argc;
+        if (!copyUserPath(regs->rdi, path, sizeof(path)) ||
+            !copyUserArgv(regs->rsi, argvStorage, argvPtrs, &argc))
+            regs->rax = (uint64)-1;
+        else
+            regs->rax = (uint64)doSpawn(path, argvPtrs, argc);
+        return (uint64)regs;
+    }
+    case sysWait: {
+        uint32 id = (uint32)regs->rdi;
+        if (id == waitAnyPid) {
+            /* waitpid(-1)-style "wait for ANY child" -- see
+               threadJoinAnyChild's own doc comment (sched.h) for the full
+               contract. regs->rsi is an optional user `long*` pointer
+               (userWaitAny's outPid, ulib.c) that receives which pid
+               actually got reaped; nullptr means the caller does not care.
+               Written as a full 8-byte store below to match `long`'s real
+               width, not truncated to sizeof(uint32) -- a narrower store
+               would leave the user variable's upper 4 bytes as whatever
+               uninitialized garbage the caller's stack already had. */
+            if (regs->rsi != 0 && !userRangeOk(regs->rsi, sizeof(uint64))) {
+                regs->rax = (uint64)-1;
+                return (uint64)regs;
+            }
+            uint32 reapedId;
+            int64 code;
+            WaitScanResult scan = threadJoinAnyChild(currentThreadId(), &reapedId, &code);
+            if (scan == waitScanNoChildren) {
+                regs->rax = (uint64)-1;
+                return (uint64)regs;
+            }
+            if (scan == waitScanNoneDead) {
+                /* Same retry-syscall dance as the specific-pid path below,
+                   just parked on our OWN slot instead of a named child's --
+                   threadExit/threadKill wake this channel for EVERY dying
+                   child of ours, not just one in particular (see
+                   threadJoinAnyChild's doc comment), so re-scanning from
+                   scratch on each retry is what actually picks up whichever
+                   one died. */
+                currentThread()->sigInRetryableSyscall = true;
+                schedBlockCurrent(currentThread());
+                regs->rip -= 2;
+                return schedule((uint64)regs);
+            }
+            if (regs->rsi != 0)
+                *(uint64*)regs->rsi = (uint64)reapedId;
+            regs->rax = (uint64)code;
+            return (uint64)regs;
+        }
+        if (id == 0 || id >= threadCapacity()) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        Thread* target = threadAt(id);
+        if (target->state == threadUnused) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        if (target->state != threadDead) {
+            /* Not dead yet: parking here and calling halt() the way
+               threadJoin (sched.c) does for a plain kernel thread body
+               would hang the whole machine, not just this thread -- this
+               handler runs with interrupts disabled (int 0x80 is an
+               interrupt gate, idt.c) on the single shared bootstrap kernel
+               stack (isrStubs.S/tss.c), not the calling thread's own
+               persistent one, so unlike kmain.c's joinerThread it cannot
+               literally halt in place and pick its own C call frame back
+               up later: hlt with IF=0 never wakes, since nothing can ever
+               deliver the timer interrupt that would run schedule() again.
+               Instead: block on the same channel threadExit wakes
+               (schedWakeChannel(&threads[id])), rewind rip by the 2 bytes
+               of the `int $0x80` opcode this trap just came from so it
+               re-executes once this thread is scheduled again, and hand
+               the CPU to schedule() -- the same "flip state, then let the
+               interrupt-return path do the actual waiting" technique
+               sysSleep already uses. The retry re-enters this exact case
+               with the same rax/rdi; since threadExit will have already
+               flipped the target to Dead before waking this thread back
+               up, it takes the branch below next time and completes
+               without blocking again. */
+            currentThread()->sigInRetryableSyscall = true;
+            schedBlockCurrent(target);
+            regs->rip -= 2;
+            return schedule((uint64)regs);
+        }
+        regs->rax = (uint64)threadJoin(id);
+        return (uint64)regs;
+    }
+    case sysMmap: {
+        /* addrHint==0 means "kernel picks" (mmapReserve's own first-fit,
+           real mmap(NULL, ...) shape); a nonzero addrHint is taken as an
+           exact placement request, refused (not silently relocated) if it
+           does not fit -- there is no MAP_FIXED bit to distinguish the two,
+           every addrHint here behaves like real mmap's own weaker "hint"
+           contract already narrowed down to "exact or refused". fd/offset
+           are read (and validated below) even when MAP_ANONYMOUS is set,
+           harmlessly ignored by mmapReserve itself in that case, exactly
+           like real mmap(2)'s own documented behavior. */
+        uint64 addrHint = regs->rdi;
+        uint64 length = regs->rsi;
+        uint32 prot = (uint32)regs->rdx;
+        uint32 flags = (uint32)regs->r10;
+        int fd = (int)regs->r8;
+        uint64 offset = regs->r9;
+        bool anonymous = (flags & mmapAnonymous) != 0;
+
+        if (!anonymous) {
+            /* Same three seekable, real-data fd kinds vfsLseek itself
+               already restricts to (vfs.c) -- a pipe/fifo/console/pidfd fd
+               has no fixed byte range a page fault could ever re-read
+               deterministically, so mmap refuses them here rather than
+               letting mmapFaultHandler discover that failure lazily, one
+               page at a time, later. */
+            if (fd < 0 || fd >= maxOpenFiles) {
+                regs->rax = (uint64)-1;
+                return (uint64)regs;
+            }
+            FileDescriptor* fdEntry = &currentThread()->fds[fd];
+            if (fdEntry->kind != fdFile && fdEntry->kind != fdSfs && fdEntry->kind != fdBlockDev) {
+                regs->rax = (uint64)-1;
+                return (uint64)regs;
+            }
+        }
+
+        uint64 mappedAddr;
+        if (!mmapReserve(currentThread(), addrHint, length, prot, anonymous, fd, offset, &mappedAddr)) {
+            regs->rax = (uint64)-1;
+            return (uint64)regs;
+        }
+        regs->rax = mappedAddr;
+        return (uint64)regs;
+    }
+    case sysMunmap:
+        regs->rax = mmapRelease(currentThread(), regs->rdi, regs->rsi) ? 0 : (uint64)-1;
+        return (uint64)regs;
     default:
         regs->rax = (uint64)-1;
         return (uint64)regs;
