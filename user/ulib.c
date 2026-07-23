@@ -371,3 +371,43 @@ void printDec(long value)
         ordered[i] = reversed[length - 1 - i];
     userWrite(1, ordered, (unsigned long)length);
 }
+
+void decToString(long value, char* out)
+{
+    unsigned long magnitude;
+    int i = 0;
+    if (value < 0) {
+        out[i++] = '-';
+        magnitude = (unsigned long)(-value);
+    } else {
+        magnitude = (unsigned long)value;
+    }
+
+    char digits[24];
+    int length = 0;
+    do {
+        digits[length++] = (char)('0' + (magnitude % 10));
+        magnitude /= 10;
+    } while (magnitude > 0);
+
+    while (length > 0)
+        out[i++] = digits[--length];
+    out[i] = 0;
+}
+
+long parseDec(const char* text)
+{
+    int i = 0;
+    int negative = 0;
+    if (text[0] == '-') {
+        negative = 1;
+        i = 1;
+    }
+
+    long value = 0;
+    while (text[i] >= '0' && text[i] <= '9') {
+        value = value * 10 + (text[i] - '0');
+        i++;
+    }
+    return negative ? -value : value;
+}
