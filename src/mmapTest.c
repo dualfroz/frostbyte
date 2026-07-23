@@ -157,3 +157,164 @@ KTEST(mmapFaultHandlerRefusesAddressOutsideAnyVma)
     Thread* self = currentThread();
     uint64 previous = setupSlot(self);
 
+    KT_FALSE(t, mmapFaultHandler(self, mmapTestSlotBase + elfSlotStackOffset + 5 * frameSize, false));
+
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapFaultHandlerFileBackedReadsRealFileContent)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+
+    const char* payload = "mmapTest file-backed page content, byte-for-byte.";
+    int fd = vfsOpen("/tmp/mmaptest-src.txt", oReadWrite | oCreate | oTrunc);
+    KT_TRUE(t, fd >= 0);
+    KT_EQ(t, vfsWrite(fd, payload, strlen(payload)), (int64)strlen(payload));
+
+    uint64 addr;
+    KT_TRUE(t, mmapReserve(self, 0, frameSize, mmapProtRead, false, fd, 0, &addr));
+    KT_TRUE(t, mmapFaultHandler(self, addr, false));
+
+    KT_TRUE(t, memcmp((const void*)addr, payload, strlen(payload)) == 0);
+    /* Past end-of-file within the same page: zero-padded, not garbage. */
+    KT_EQ(t, ((const uint8*)addr)[strlen(payload)], 0);
+
+    /* The fd's own seek offset must be exactly what it was before the
+       fault -- mmapFaultHandler saves/restores it around its own read, so
+       a caller's ordinary vfsRead/vfsLseek use of the same fd is never
+       disturbed by an unrelated page fault. */
+    KT_EQ(t, vfsLseek(fd, 0, seekCur), (int64)strlen(payload));
+
+    vfsClose(fd);
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapFaultHandlerRefusesFileBackedReadAfterFdClosed)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+
+    int fd = vfsOpen("/tmp/mmaptest-closed.txt", oReadWrite | oCreate | oTrunc);
+    KT_TRUE(t, fd >= 0);
+    KT_EQ(t, vfsWrite(fd, "x", 1), 1);
+
+    uint64 addr;
+    KT_TRUE(t, mmapReserve(self, 0, frameSize, mmapProtRead, false, fd, 0, &addr));
+    vfsClose(fd);
+
+    /* Honestly scoped limitation (see mmap.h's own Vma doc comment): this
+       mapping cannot outlive the fd that backs it. A fault against it once
+       the fd is gone must fail cleanly, never silently serve zeroed or
+       stale data as if it had succeeded. */
+    KT_FALSE(t, mmapFaultHandler(self, addr, false));
+    KT_EQ(t, pagingResolve(addr), 0);
+
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapReleaseFreesFramesAndAllowsReReservation)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+    uint64 framesBefore = pmmFreeFrames();
+
+    uint64 addr;
+    KT_TRUE(t, mmapReserve(self, 0, 2 * frameSize, mmapProtRead | mmapProtWrite, true, -1, 0, &addr));
+    KT_TRUE(t, mmapFaultHandler(self, addr, false));
+    KT_TRUE(t, mmapFaultHandler(self, addr + frameSize, false));
+    KT_LE(t, pmmFreeFrames(), framesBefore - 2);
+
+    KT_TRUE(t, mmapRelease(self, addr, 2 * frameSize));
+    KT_EQU(t, pmmFreeFrames(), framesBefore);
+    KT_EQ(t, pagingResolve(addr), 0);
+    KT_EQ(t, pagingResolve(addr + frameSize), 0);
+    KT_NULL(t, mmapFind(self, addr));
+
+    /* The address range is genuinely free again, not just unmapped. */
+    uint64 secondAddr;
+    KT_TRUE(t, mmapReserve(self, addr, 2 * frameSize, mmapProtRead, true, -1, 0, &secondAddr));
+    KT_EQU(t, secondAddr, addr);
+
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapReleaseOnNeverMappedRangeIsSafeNoop)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+    uint64 framesBefore = pmmFreeFrames();
+
+    uint64 probe = mmapTestSlotBase + elfSlotStackOffset + 10 * frameSize;
+    KT_TRUE(t, mmapRelease(self, probe, 3 * frameSize));
+    KT_EQU(t, pmmFreeFrames(), framesBefore);
+
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapReleaseSplitsMiddleOfAVmaIntoTwo)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+
+    uint64 addr;
+    KT_TRUE(t, mmapReserve(self, 0, 3 * frameSize, mmapProtRead | mmapProtWrite, true, -1, 0, &addr));
+    KT_TRUE(t, mmapFaultHandler(self, addr, false));
+    KT_TRUE(t, mmapFaultHandler(self, addr + frameSize, false));
+    KT_TRUE(t, mmapFaultHandler(self, addr + 2 * frameSize, false));
+
+    /* Unmap only the middle page -- the low and high pages must survive,
+       untouched, as two now-independent Vmas. */
+    KT_TRUE(t, mmapRelease(self, addr + frameSize, frameSize));
+
+    KT_NE(t, pagingResolve(addr), 0);
+    KT_EQ(t, pagingResolve(addr + frameSize), 0);
+    KT_NE(t, pagingResolve(addr + 2 * frameSize), 0);
+
+    KT_NOTNULL(t, mmapFind(self, addr));
+    KT_NULL(t, mmapFind(self, addr + frameSize));
+    KT_NOTNULL(t, mmapFind(self, addr + 2 * frameSize));
+
+    /* The middle gap is genuinely free address space again. */
+    uint64 refilled;
+    KT_TRUE(t, mmapReserve(self, addr + frameSize, frameSize, mmapProtRead, true, -1, 0, &refilled));
+
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapReserveFailsOnceVmaTableIsFull)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+
+    uint64 addr;
+    for (int i = 0; i < maxVmasPerThread; i++)
+        KT_TRUE(t, mmapReserve(self, 0, frameSize, mmapProtRead, true, -1, 0, &addr));
+
+    KT_FALSE(t, mmapReserve(self, 0, frameSize, mmapProtRead, true, -1, 0, &addr));
+
+    teardownSlot(self, previous);
+}
+
+KTEST(mmapReleaseAllClearsBookkeepingOnly)
+{
+    Thread* self = currentThread();
+    uint64 previous = setupSlot(self);
+
+    uint64 addr;
+    KT_TRUE(t, mmapReserve(self, 0, frameSize, mmapProtRead, true, -1, 0, &addr));
+    KT_TRUE(t, mmapFaultHandler(self, addr, false));
+    KT_NE(t, pagingResolve(addr), 0);
+
+    mmapReleaseAll(self);
+
+    KT_NULL(t, mmapFind(self, addr));
+    /* mmapReleaseAll deliberately does not touch the page table -- callers
+       that need the frame back reclaim it their own way first (doExec).
+       The frame is still really mapped; teardownSlot's own whole-region
+       pagingUnmapUserRange (not mmapReleaseAll again) is what reclaims it
+       for this test. */
+    KT_NE(t, pagingResolve(addr), 0);
+
+    teardownSlot(self, previous);
+}
