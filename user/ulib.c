@@ -11,6 +11,41 @@ static long syscall3(long number, long a1, long a2, long a3)
     return ret;
 }
 
+/* Same trap as syscall3, with a 4th argument -- passed in r10, not rcx,
+   the same choice the real Linux x86-64 syscall ABI makes (rcx is already
+   spoken for by the `int $0x80`/syscall instruction's own use, so a fourth
+   argument needs a register the trap does not otherwise touch). Only
+   userSigAction needs one today. */
+static long syscall4(long number, long a1, long a2, long a3, long a4)
+{
+    long ret;
+    register long a4Reg __asm__("r10") = a4;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(number), "D"(a1), "S"(a2), "d"(a3), "r"(a4Reg)
+        : "memory", "rcx", "r11");
+    return ret;
+}
+
+/* Same trap again, with a 5th and 6th argument in r8/r9 -- the same real
+   Linux x86-64 syscall ABI register order this file's own 4th-argument
+   choice (r10) already follows, continued one register further. Only
+   userMmap needs this many today. */
+static long syscall6(long number, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    long ret;
+    register long a4Reg __asm__("r10") = a4;
+    register long a5Reg __asm__("r8") = a5;
+    register long a6Reg __asm__("r9") = a6;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(number), "D"(a1), "S"(a2), "d"(a3), "r"(a4Reg), "r"(a5Reg), "r"(a6Reg)
+        : "memory", "rcx", "r11");
+    return ret;
+}
+
 long userWrite(int fd, const char* buffer, unsigned long length)
 {
     return syscall3(sysWrite, fd, (long)buffer, (long)length);
@@ -46,6 +81,16 @@ void userSleep(unsigned long milliseconds)
     syscall3(sysSleep, (long)milliseconds, 0, 0);
 }
 
+unsigned long userAlarm(unsigned long seconds)
+{
+    return (unsigned long)syscall3(sysAlarm, (long)seconds, 0, 0);
+}
+
+long userPoll(PollFd* fds, unsigned long nfds, long timeoutMs)
+{
+    return syscall3(sysPoll, (long)fds, (long)nfds, timeoutMs);
+}
+
 long userOpen(const char* path, unsigned int flags)
 {
     return syscall3(sysOpen, (long)path, (long)flags, 0);
@@ -79,6 +124,211 @@ long userMkdir(const char* path)
 long userUnlink(const char* path)
 {
     return syscall3(sysUnlink, (long)path, 0, 0);
+}
+
+long userRmdir(const char* path)
+{
+    return syscall3(sysRmdir, (long)path, 0, 0);
+}
+
+long userChmod(const char* path, unsigned int mode)
+{
+    return syscall3(sysChmod, (long)path, (long)mode, 0);
+}
+
+long userChown(const char* path, unsigned int uid)
+{
+    return syscall3(sysChown, (long)path, (long)uid, 0);
+}
+
+long userGetuid(void)
+{
+    return syscall3(sysGetuid, 0, 0, 0);
+}
+
+long userSetuid(unsigned int uid)
+{
+    return syscall3(sysSetuid, (long)uid, 0, 0);
+}
+
+long userGetgid(void)
+{
+    return syscall3(sysGetgid, 0, 0, 0);
+}
+
+long userSetgid(unsigned int gid)
+{
+    return syscall3(sysSetgid, (long)gid, 0, 0);
+}
+
+long userChgrp(const char* path, unsigned int gid)
+{
+    return syscall3(sysChgrp, (long)path, (long)gid, 0);
+}
+
+long userChdir(const char* path)
+{
+    return syscall3(sysChdir, (long)path, 0, 0);
+}
+
+long userGetcwd(char* buffer, unsigned long cap)
+{
+    return syscall3(sysGetcwd, (long)buffer, (long)cap, 0);
+}
+
+long userGetEnv(const char* name, char* buffer, unsigned long cap)
+{
+    return syscall3(sysGetEnv, (long)name, (long)buffer, (long)cap);
+}
+
+long userSetEnv(const char* name, const char* value)
+{
+    return syscall3(sysSetEnv, (long)name, (long)value, 0);
+}
+
+long userUnsetEnv(const char* name)
+{
+    return syscall3(sysUnsetEnv, (long)name, 0, 0);
+}
+
+long userPipe(int fds[2])
+{
+    return syscall3(sysPipe, (long)fds, 0, 0);
+}
+
+long userPipeCreate(void)
+{
+    return syscall3(sysPipeCreate, 0, 0, 0);
+}
+
+long userPipeAttach(long handle, int wantWrite)
+{
+    return syscall3(sysPipeAttach, handle, wantWrite, 0);
+}
+
+long userSymlink(const char* target, const char* path)
+{
+    return syscall3(sysSymlink, (long)target, (long)path, 0);
+}
+
+long userReadlink(const char* path, char* buffer, unsigned long cap)
+{
+    return syscall3(sysReadlink, (long)path, (long)buffer, (long)cap);
+}
+
+long userLink(const char* existingPath, const char* newPath)
+{
+    return syscall3(sysLink, (long)existingPath, (long)newPath, 0);
+}
+
+long userMkfifo(const char* path)
+{
+    return syscall3(sysMkfifo, (long)path, 0, 0);
+}
+
+long userExec(const char* path, char* const argv[])
+{
+    return syscall3(sysExec, (long)path, (long)argv, 0);
+}
+
+long userSpawn(const char* path, char* const argv[])
+{
+    return syscall3(sysSpawn, (long)path, (long)argv, 0);
+}
+
+long userWait(long pid)
+{
+    return syscall3(sysWait, pid, 0, 0);
+}
+
+long userWaitAny(long* outPid)
+{
+    return syscall3(sysWait, (long)waitAnyPid, (long)outPid, 0);
+}
+
+long userKill(long pid)
+{
+    return syscall3(sysKill, pid, 0, 0);
+}
+
+long userSigSend(long pid, int signum)
+{
+    return syscall3(sysSigSend, pid, signum, 0);
+}
+
+long userPidfdOpen(long pid)
+{
+    return syscall3(sysPidfdOpen, pid, 0, 0);
+}
+
+long userPidfdSend(long fd, int signum)
+{
+    return syscall3(sysPidfdSend, fd, signum, 0);
+}
+
+long userPidfdWait(long fd)
+{
+    return syscall3(sysPidfdWait, fd, 0, 0);
+}
+
+void* userMmap(void* addrHint, unsigned long length, int prot, int flags, int fd, long offset)
+{
+    return (void*)syscall6(sysMmap, (long)addrHint, (long)length, prot, flags, fd, offset);
+}
+
+long userMunmap(void* addr, unsigned long length)
+{
+    return syscall3(sysMunmap, (long)addr, (long)length, 0);
+}
+
+long userSigAction(int signum, SigHandler handler, unsigned long mask, unsigned long flags)
+{
+    return syscall4(sysSigAction, signum, (long)handler, (long)mask, (long)flags);
+}
+
+long userSigActionInfo(int signum, SigInfoHandler handler, unsigned long mask, unsigned long flags)
+{
+    return syscall4(sysSigAction, signum, (long)handler, (long)mask, (long)flags);
+}
+
+unsigned long userSigProcMask(int how, unsigned long mask)
+{
+    return (unsigned long)syscall3(sysSigProcMask, how, (long)mask, 0);
+}
+
+long userSetpgid(long pid, long pgid)
+{
+    return syscall3(sysSetpgid, pid, pgid, 0);
+}
+
+long userGetpgid(long pid)
+{
+    return syscall3(sysGetpgid, pid, 0, 0);
+}
+
+long userNice(long pid, long weight)
+{
+    return syscall3(sysNice, pid, weight, 0);
+}
+
+long userGetPriority(long pid)
+{
+    return syscall3(sysGetPriority, pid, 0, 0);
+}
+
+long userTime(void)
+{
+    return syscall3(sysTime, 0, 0, 0);
+}
+
+long userSetForegroundPgid(long pgid)
+{
+    return syscall3(sysSetFgPgrp, pgid, 0, 0);
+}
+
+long userGetForegroundPgid(void)
+{
+    return syscall3(sysGetFgPgrp, 0, 0, 0);
 }
 
 unsigned long stringLength(const char* text)
