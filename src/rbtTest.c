@@ -154,3 +154,146 @@ KTEST(rbtSingleRemoveRelinksNeighbors)
     RbTree tree;
     rbtInit(&tree);
 
+    IntNode nodes[5];
+    int32 values[] = { 10, 20, 30, 40, 50 };
+    for (int i = 0; i < 5; i++) {
+        nodes[i].key = values[i];
+        rbtInsert(&tree, &nodes[i].node, compareIntNode);
+    }
+
+    rbtRemove(&tree, &nodes[2].node);   /* remove 30, the middle */
+    KT_EQ(t, rbtCount(&tree), 4);
+    KT_TRUE(t, checkInvariants(&tree));
+
+    int32 key30 = 30;
+    KT_NULL(t, rbtFind(&tree, &key30, lookupIntKey));
+
+    int32 expected[] = { 10, 20, 40, 50 };
+    usize i = 0;
+    for (RbtNode* c = rbtFirst(&tree); c != nullptr; c = rbtNext(c), i++)
+        KT_EQ(t, rbtEntry(c, IntNode, node)->key, expected[i]);
+    KT_EQ(t, i, 4);
+}
+
+#define rbtStressN 500
+
+KTEST(rbtStressInsertMaintainsInvariants)
+{
+    IntNode* pool = (IntNode*)kmalloc(sizeof(IntNode) * rbtStressN);
+    int32* order = (int32*)kmalloc(sizeof(int32) * rbtStressN);
+    KT_NOTNULL(t, pool);
+    KT_NOTNULL(t, order);
+    if (!pool || !order) {
+        kfree(pool);
+        kfree(order);
+        return;
+    }
+
+    for (int32 i = 0; i < rbtStressN; i++)
+        order[i] = i;
+    shuffle(order, rbtStressN, 0xC0FFEEu);
+
+    RbTree tree;
+    rbtInit(&tree);
+    for (int32 i = 0; i < rbtStressN; i++) {
+        int32 key = order[i];
+        pool[key].key = key;
+        KT_TRUE(t, rbtInsert(&tree, &pool[key].node, compareIntNode));
+    }
+    KT_EQ(t, rbtCount(&tree), rbtStressN);
+    KT_TRUE(t, checkInvariants(&tree));
+
+    int32 expect = 0;
+    usize visited = 0;
+    for (RbtNode* c = rbtFirst(&tree); c != nullptr; c = rbtNext(c)) {
+        KT_EQ(t, rbtEntry(c, IntNode, node)->key, expect);
+        expect++;
+        visited++;
+    }
+    KT_EQ(t, visited, rbtStressN);
+
+    kfree(pool);
+    kfree(order);
+}
+
+KTEST(rbtStressRemoveMaintainsInvariants)
+{
+    IntNode* pool = (IntNode*)kmalloc(sizeof(IntNode) * rbtStressN);
+    int32* order = (int32*)kmalloc(sizeof(int32) * rbtStressN);
+    int32* removeOrder = (int32*)kmalloc(sizeof(int32) * rbtStressN);
+    KT_NOTNULL(t, pool);
+    KT_NOTNULL(t, order);
+    KT_NOTNULL(t, removeOrder);
+    if (!pool || !order || !removeOrder) {
+        kfree(pool);
+        kfree(order);
+        kfree(removeOrder);
+        return;
+    }
+
+    for (int32 i = 0; i < rbtStressN; i++) {
+        order[i] = i;
+        removeOrder[i] = i;
+    }
+    shuffle(order, rbtStressN, 0xDEADBEEFu);
+    shuffle(removeOrder, rbtStressN, 0x1234567u);
+
+    RbTree tree;
+    rbtInit(&tree);
+    for (int32 i = 0; i < rbtStressN; i++) {
+        int32 key = order[i];
+        pool[key].key = key;
+        rbtInsert(&tree, &pool[key].node, compareIntNode);
+    }
+
+    /* remove every even key, in scrambled order */
+    int32 removed = 0;
+    for (int32 i = 0; i < rbtStressN; i++) {
+        int32 key = removeOrder[i];
+        if (key % 2 != 0)
+            continue;
+        RbtNode* found = rbtFind(&tree, &key, lookupIntKey);
+        KT_NOTNULL(t, found);
+        if (found) {
+            rbtRemove(&tree, found);
+            removed++;
+        }
+    }
+    KT_EQ(t, rbtCount(&tree), rbtStressN - removed);
+    KT_TRUE(t, checkInvariants(&tree));
+
+    for (int32 key = 0; key < rbtStressN; key++) {
+        RbtNode* found = rbtFind(&tree, &key, lookupIntKey);
+        if (key % 2 == 0)
+            KT_NULL(t, found);
+        else
+            KT_NOTNULL(t, found);
+    }
+
+    int32 expect = 1;
+    usize visited = 0;
+    for (RbtNode* c = rbtFirst(&tree); c != nullptr; c = rbtNext(c)) {
+        KT_EQ(t, rbtEntry(c, IntNode, node)->key, expect);
+        expect += 2;
+        visited++;
+    }
+    KT_EQ(t, visited, rbtStressN - removed);
+
+    /* drain the rest, in the same scrambled order, down to nothing */
+    for (int32 i = 0; i < rbtStressN; i++) {
+        int32 key = removeOrder[i];
+        if (key % 2 == 0)
+            continue;
+        RbtNode* found = rbtFind(&tree, &key, lookupIntKey);
+        if (found)
+            rbtRemove(&tree, found);
+    }
+    KT_TRUE(t, rbtIsEmpty(&tree));
+    KT_EQ(t, rbtCount(&tree), 0);
+    KT_NULL(t, rbtFirst(&tree));
+    KT_NULL(t, rbtLast(&tree));
+
+    kfree(pool);
+    kfree(order);
+    kfree(removeOrder);
+}
