@@ -311,3 +311,160 @@ KTEST(sfsPersistsAcrossUnmountRemount)
     if (!KT_TRUE(t, sfsFormat()))
         return;
 
+    KT_TRUE(t, sfsCreateDir("keep") > 0);
+    int32 f = sfsCreateFile("keep/data.bin");
+    KT_TRUE(t, f > 0);
+    const char* payload = "this must survive a real remount";
+    uint64 len = strlen(payload);
+    KT_EQ(t, sfsWriteAt(f, 0, payload, len), (int64)len);
+
+    sfsUnmount();
+    KT_FALSE(t, sfsMounted());
+
+    KT_TRUE(t, sfsMount());
+    KT_TRUE(t, sfsMounted());
+
+    int32 reloaded = sfsLookup("keep/data.bin");
+    KT_EQ(t, reloaded, f);
+    KT_EQ(t, sfsSizeOf(reloaded), len);
+
+    char back[64];
+    memset(back, 0, sizeof(back));
+    KT_EQ(t, sfsReadAt(reloaded, 0, back, len), (int64)len);
+    KT_EQ(t, memcmp(back, payload, len), 0);
+}
+
+KTEST(sfsMountWithoutFormatRecoversPriorState)
+{
+    /* sfsMount() on an already-formatted disk must NOT reformat: a second
+       mount call has to see the first mount's data, exactly like a real
+       reboot re-mounting an existing filesystem. */
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("survives.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "still here", 10), 10);
+    sfsUnmount();
+
+    KT_TRUE(t, sfsMount());
+    int32 found = sfsLookup("survives.txt");
+    KT_EQ(t, found, f);
+    char back[10];
+    KT_EQ(t, sfsReadAt(found, 0, back, 10), 10);
+    KT_EQ(t, memcmp(back, "still here", 10), 0);
+}
+
+/*
+ * mtime/ctime coverage below. Every bound uses a real rtcNow() reading taken
+ * strictly before or after the operation under test, in this same thread, so
+ * "before <= stamped-value <= after" is a real chronological fact (the clock
+ * only ever moves forward), never a flaky timing assumption -- unlike a
+ * cross-run "did it increase" check, which would need a real elapsed second
+ * to be meaningful. sfsLinkBumpsCtimeButNeverTouchesMtime instead checks
+ * exact, timing-independent equality: the link code path must never write
+ * inode.mtime at all, so it has to come back byte-for-byte unchanged
+ * regardless of how much wall-clock time passed.
+ */
+
+KTEST(sfsCreateFileStampsMtimeAndCtimeNearNow)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int64 before = rtcNow();
+    int32 f = sfsCreateFile("stamped.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    int64 after = rtcNow();
+
+    uint64 mtime = sfsMtimeOf(f);
+    uint64 ctime = sfsCtimeOf(f);
+    KT_EQ(t, mtime, ctime);
+    KT_GE(t, mtime, before);
+    KT_LE(t, mtime, after);
+}
+
+KTEST(sfsWriteAtBumpsMtimeAndCtimeStayingInSync)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("written.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    uint64 createdMtime = sfsMtimeOf(f);
+
+    int64 before = rtcNow();
+    const char* payload = "sfs mtime test payload";
+    uint64 len = strlen(payload);
+    KT_EQ(t, sfsWriteAt(f, 0, payload, len), (int64)len);
+    int64 after = rtcNow();
+
+    uint64 mtime = sfsMtimeOf(f);
+    uint64 ctime = sfsCtimeOf(f);
+    KT_EQ(t, mtime, ctime);
+    KT_GE(t, mtime, createdMtime);
+    KT_GE(t, mtime, before);
+    KT_LE(t, mtime, after);
+}
+
+KTEST(sfsLinkBumpsCtimeButNeverTouchesMtime)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("original.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQ(t, sfsWriteAt(f, 0, "hi", 2), 2);
+
+    uint64 mtimeBeforeLink = sfsMtimeOf(f);
+    uint64 ctimeBeforeLink = sfsCtimeOf(f);
+
+    int64 before = rtcNow();
+    KT_EQ(t, sfsLink("original.txt", "alias.txt"), f);
+    int64 after = rtcNow();
+
+    KT_EQ(t, sfsMtimeOf(f), mtimeBeforeLink);
+    KT_GE(t, sfsCtimeOf(f), ctimeBeforeLink);
+    KT_GE(t, sfsCtimeOf(f), before);
+    KT_LE(t, sfsCtimeOf(f), after);
+}
+
+KTEST(sfsRemoveOneOfTwoHardlinksBumpsRemainingLinkCtime)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("keepme.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQ(t, sfsLink("keepme.txt", "alias2.txt"), f);
+    KT_EQ(t, sfsLinkCountOf(f), 2u);
+
+    uint64 ctimeBeforeRemove = sfsCtimeOf(f);
+    int64 before = rtcNow();
+    KT_TRUE(t, sfsRemove("alias2.txt"));
+    int64 after = rtcNow();
+
+    KT_EQ(t, sfsLinkCountOf(f), 1u);
+    KT_GE(t, sfsCtimeOf(f), ctimeBeforeRemove);
+    KT_GE(t, sfsCtimeOf(f), before);
+    KT_LE(t, sfsCtimeOf(f), after);
+}
+
+KTEST(sfsPersistsMtimeAndCtimeAcrossUnmountRemount)
+{
+    /* Same real point as sfsPersistsAcrossUnmountRemount above, applied to
+       the new fields: sfsUnmount() drops every in-memory structure, so an
+       exact match after sfsMount() proves these timestamps genuinely live on
+       disk inside the inode, not in some cache that happens to survive. */
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("timepersist.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQ(t, sfsWriteAt(f, 0, "persisted", 9), 9);
+
