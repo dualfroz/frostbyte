@@ -1264,3 +1264,94 @@ KTEST(sfsRemoveOneHardlinkKeepsOtherAlive)
     KT_TRUE(t, sfsRemove("first.txt"));
     KT_EQ(t, sfsLookup("first.txt"), -1);
 
+    int32 viaSecond = sfsLookup("second.txt");
+    KT_EQ(t, viaSecond, f);
+    KT_EQ(t, sfsLinkCountOf(viaSecond), 1);
+
+    char back[8];
+    KT_EQ(t, sfsReadAt(viaSecond, 0, back, 7), 7);
+    KT_EQ(t, memcmp(back, "durable", 7), 0);
+}
+
+KTEST(sfsRemoveLastHardlinkFreesInodeAndBlocks)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    uint64 baseline = sfsFreeDataBlocks();
+
+    int32 f = sfsCreateFile("only.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "temporary", 9), 9);
+    KT_TRUE(t, sfsLink("only.txt", "also.txt") > 0);
+    KT_LT(t, sfsFreeDataBlocks(), baseline);
+
+    KT_TRUE(t, sfsRemove("only.txt"));
+    KT_NE(t, sfsLookup("also.txt"), -1); /* one link left: data still lives */
+    KT_TRUE(t, sfsRemove("also.txt"));
+    KT_EQ(t, sfsLookup("also.txt"), -1);
+
+    KT_EQU(t, sfsFreeDataBlocks(), baseline);
+
+    /* The inode slot must be reusable, not permanently burned. */
+    int32 again = sfsCreateFile("only.txt");
+    KT_TRUE(t, again > 0);
+    KT_EQ(t, sfsSizeOf(again), 0);
+}
+
+KTEST(sfsHardlinkThroughSymlinkTargetsRealInode)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("real.txt");
+    KT_TRUE(t, f > 0);
+    KT_TRUE(t, sfsCreateSymlink("link.txt", "real.txt") > 0);
+
+    /* Linking through a symlink must attach the new name to whatever the
+       symlink resolves to, not to the symlink inode itself (matches
+       link()'s default follow-existingPath semantics, documented on
+       sfsLink). */
+    int32 linked = sfsLink("link.txt", "alias.txt");
+    KT_EQ(t, linked, f);
+    KT_EQ(t, sfsLinkCountOf(f), 2);
+    KT_EQ(t, sfsTypeOf(sfsLookup("alias.txt")), sfsTypeFile);
+}
+
+KTEST(sfsHardlinkPersistsAcrossUnmountRemount)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("orig.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "persisted", 9), 9);
+    KT_TRUE(t, sfsLink("orig.txt", "alias.txt") > 0);
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    int32 viaOrig = sfsLookup("orig.txt");
+    int32 viaAlias = sfsLookup("alias.txt");
+    KT_EQ(t, viaOrig, f);
+    KT_EQ(t, viaOrig, viaAlias);
+    KT_EQ(t, sfsLinkCountOf(f), 2);
+
+    char back[16];
+    memset(back, 0, sizeof(back));
+    KT_EQ(t, sfsReadAt(viaAlias, 0, back, 9), 9);
+    KT_EQ(t, memcmp(back, "persisted", 9), 0);
+}
+
+/* Leave the filesystem in a clean, empty, formatted state for any code that
+   runs after the ktest battery (e.g. a userspace program exercising /mnt
+   through the real syscall path). */
+KTEST(sfsFormatLeavesCleanStateForLaterUse)
+{
+    KT_TRUE(t, sfsFormat());
+    KT_EQ(t, sfsLookup(""), sfsRootInode);
+
+    char name[sfsNameMax + 1];
+    uint32 type;
+    KT_FALSE(t, sfsReaddirAt(sfsRootInode, 0, name, sizeof(name), &type));
+}
