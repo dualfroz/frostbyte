@@ -781,3 +781,486 @@ KTEST(sfsSymlinkResolvesToTargetFile)
     if (!KT_TRUE(t, sfsFormat()))
         return;
 
+    int32 f = sfsCreateFile("real.txt");
+    KT_TRUE(t, f > 0);
+    const char* msg = "reached through a link";
+    uint64 len = strlen(msg);
+    KT_EQ(t, sfsWriteAt(f, 0, msg, len), (int64)len);
+
+    int32 link = sfsCreateSymlink("link.txt", "real.txt");
+    KT_TRUE(t, link > 0);
+    KT_NE(t, link, f);
+
+    /* sfsLookup follows the symlink: it must land on the SAME inode as
+       looking the real file up directly, not a copy of it. */
+    KT_EQ(t, sfsLookup("link.txt"), f);
+    KT_EQ(t, sfsTypeOf(sfsLookup("link.txt")), sfsTypeFile);
+
+    char back[64];
+    memset(back, 0, sizeof(back));
+    KT_EQ(t, sfsReadAt(sfsLookup("link.txt"), 0, back, len), (int64)len);
+    KT_EQ(t, memcmp(back, msg, len), 0);
+}
+
+KTEST(sfsReadlinkReturnsStoredTargetAndNoFollowSeesTheLinkItself)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("real.txt");
+    KT_TRUE(t, f > 0);
+    int32 link = sfsCreateSymlink("link.txt", "real.txt");
+    KT_TRUE(t, link > 0);
+
+    char target[32];
+    memset(target, 0, sizeof(target));
+    KT_TRUE(t, sfsReadlink(link, target, sizeof(target)));
+    KT_STREQ(t, target, "real.txt");
+
+    /* No-follow gives back the symlink's own inode (and its own type),
+       distinct from what sfsLookup (which follows) would give. */
+    int32 noFollow = sfsLookupNoFollow("link.txt");
+    KT_EQ(t, noFollow, link);
+    KT_EQ(t, sfsTypeOf(noFollow), sfsTypeSymlink);
+    KT_NE(t, noFollow, f);
+}
+
+KTEST(sfsReadlinkRejectsNonSymlinkAndUndersizedBuffer)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("plain.txt");
+    KT_TRUE(t, f > 0);
+    char buf[8];
+    KT_FALSE(t, sfsReadlink(f, buf, sizeof(buf)));
+
+    int32 link = sfsCreateSymlink("link.txt", "a target long enough to not fit");
+    KT_TRUE(t, link > 0);
+
+    char tiny[4];
+    KT_FALSE(t, sfsReadlink(link, tiny, sizeof(tiny)));
+}
+
+KTEST(sfsSymlinkToDirectoryAllowsDescendingThroughIt)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateDir("realdir") > 0);
+    int32 f = sfsCreateFile("realdir/inside.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "found me", 8), 8);
+
+    int32 link = sfsCreateSymlink("linkdir", "realdir");
+    KT_TRUE(t, link > 0);
+    KT_EQ(t, sfsTypeOf(link), sfsTypeSymlink);
+
+    /* The symlink is an INTERMEDIATE component here (there is more path
+       after it), which must still be followed even though sfsLookup's
+       "final component" special case does not apply. */
+    int32 viaLink = sfsLookup("linkdir/inside.txt");
+    KT_EQ(t, viaLink, f);
+
+    /* Creating a new file through the symlinked directory must land in the
+       real directory, reachable from both paths. */
+    KT_TRUE(t, sfsCreateFile("linkdir/new.txt") > 0);
+    KT_EQ(t, sfsLookup("realdir/new.txt"), sfsLookup("linkdir/new.txt"));
+}
+
+KTEST(sfsDanglingSymlinkFailsLookupButReadlinkStillWorks)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 link = sfsCreateSymlink("broken.txt", "does/not/exist.txt");
+    KT_TRUE(t, link > 0);
+
+    KT_EQ(t, sfsLookup("broken.txt"), -1);
+
+    char target[64];
+    memset(target, 0, sizeof(target));
+    KT_TRUE(t, sfsReadlink(link, target, sizeof(target)));
+    KT_STREQ(t, target, "does/not/exist.txt");
+}
+
+KTEST(sfsSymlinkCycleFailsCleanlyInsteadOfHanging)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateSymlink("a", "b") > 0);
+    KT_TRUE(t, sfsCreateSymlink("b", "a") > 0);
+
+    /* The whole point: this must return with an error, not recurse forever
+       (or overflow the caller's stack) chasing a->b->a->b->... */
+    KT_EQ(t, sfsLookup("a"), -1);
+    KT_EQ(t, sfsLookup("b"), -1);
+
+    /* The table must still be in a usable state afterward - a failed
+       resolution is not the same thing as a corrupted filesystem. */
+    KT_TRUE(t, sfsCreateFile("stillworks.txt") > 0);
+}
+
+KTEST(sfsCreateSymlinkRejectsEmptyOrOversizedTarget)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_EQ(t, sfsCreateSymlink("empty.txt", ""), -1);
+
+    char huge[sfsSymlinkTargetMax + 2];
+    memset(huge, 'x', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = 0;
+    KT_EQ(t, sfsCreateSymlink("huge.txt", huge), -1);
+
+    /* Rejected attempts must not leave a half-created inode or directory
+       entry behind. */
+    KT_EQ(t, sfsLookupNoFollow("empty.txt"), -1);
+    KT_EQ(t, sfsLookupNoFollow("huge.txt"), -1);
+}
+
+KTEST(sfsRemoveSymlinkDoesNotAffectTarget)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("real.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "untouched", 9), 9);
+    KT_TRUE(t, sfsCreateSymlink("link.txt", "real.txt") > 0);
+
+    KT_TRUE(t, sfsRemove("link.txt"));
+    KT_EQ(t, sfsLookupNoFollow("link.txt"), -1);
+
+    /* The target must survive with its data intact - unlink of a symlink
+       must never recurse into what it points at. */
+    int32 stillThere = sfsLookup("real.txt");
+    KT_EQ(t, stillThere, f);
+    char back[16];
+    memset(back, 0, sizeof(back));
+    KT_EQ(t, sfsReadAt(stillThere, 0, back, 9), 9);
+    KT_EQ(t, memcmp(back, "untouched", 9), 0);
+}
+
+KTEST(sfsSymlinkPersistsAcrossUnmountRemount)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("real.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "on disk for real", 17), 17);
+    int32 link = sfsCreateSymlink("link.txt", "real.txt");
+    KT_TRUE(t, link > 0);
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    KT_EQ(t, sfsLookup("link.txt"), f);
+    KT_EQ(t, sfsLookupNoFollow("link.txt"), link);
+    KT_EQ(t, sfsTypeOf(link), sfsTypeSymlink);
+
+    char target[32];
+    memset(target, 0, sizeof(target));
+    KT_TRUE(t, sfsReadlink(link, target, sizeof(target)));
+    KT_STREQ(t, target, "real.txt");
+}
+
+KTEST(sfsFileGrowsThroughDoubleIndirectBlock)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("huge.bin");
+    KT_TRUE(t, f > 0);
+
+    /* sfsDirectBlocks (10) + sfsPtrsPerBlock (128) = 138 logical blocks are
+       reachable through direct + single indirect addressing; block 138
+       onward can only be reached through the double indirect block added
+       in this wave. Starting a few blocks before that boundary and writing
+       past it exercises the crossing and the double-indirect-only region
+       in one write (sfsWriteAt zero-fills 0..134 first, all still within
+       single-indirect range, before this pattern lands on 135..144). */
+    #define sfsDoubleSpanBlocks 10
+    #define sfsDoubleStartBlock 135
+    #define sfsDoubleSpan (sfsDoubleSpanBlocks * sfsBlockSize)
+    uint8* pattern = (uint8*)kmalloc(sfsDoubleSpan);
+    uint8* verify = (uint8*)kmalloc(sfsDoubleSpan);
+    KT_NOTNULL(t, pattern);
+    KT_NOTNULL(t, verify);
+    if (!pattern || !verify) {
+        kfree(pattern);
+        kfree(verify);
+        return;
+    }
+    for (int i = 0; i < sfsDoubleSpan; i++)
+        pattern[i] = (uint8)(i * 17 + 3);
+
+    uint64 offset = (uint64)sfsDoubleStartBlock * sfsBlockSize;
+    KT_EQ(t, sfsWriteAt(f, offset, pattern, sfsDoubleSpan), sfsDoubleSpan);
+    KT_EQ(t, sfsSizeOf(f), offset + sfsDoubleSpan);
+
+    memset(verify, 0, sfsDoubleSpan);
+    KT_EQ(t, sfsReadAt(f, offset, verify, sfsDoubleSpan), sfsDoubleSpan);
+    KT_EQ(t, memcmp(verify, pattern, sfsDoubleSpan), 0);
+
+    /* Patch a window straddling the single-indirect/double-indirect
+       boundary itself (logical block 137/138) and confirm only that slice
+       changed -- the same "boundary patch" shape as
+       sfsFileGrowsThroughIndirectBlock, one level deeper. */
+    uint8 patch[48];
+    memset(patch, 0xCC, sizeof(patch));
+    uint64 patchOffset = 138 * sfsBlockSize - 24;
+    KT_EQ(t, sfsWriteAt(f, patchOffset, patch, sizeof(patch)), (int64)sizeof(patch));
+
+    KT_EQ(t, sfsReadAt(f, offset, verify, sfsDoubleSpan), sfsDoubleSpan);
+    uint64 patchInSpan = patchOffset - offset;
+    KT_EQ(t, memcmp(verify + patchInSpan, patch, sizeof(patch)), 0);
+    KT_EQ(t, memcmp(verify, pattern, patchInSpan), 0);
+
+    kfree(pattern);
+    kfree(verify);
+    #undef sfsDoubleSpan
+    #undef sfsDoubleStartBlock
+    #undef sfsDoubleSpanBlocks
+}
+
+KTEST(sfsTruncateFreesDoubleIndirectBlocks)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("hugeshrink.bin");
+    KT_TRUE(t, f > 0);
+
+    /* Baseline is taken AFTER creating the file, not before: creating the
+       very first entry in a previously-empty root directory grows the
+       root's own data block permanently (it is a directory entry, not file
+       content, and stays even after truncating the FILE back to empty) --
+       that is correct, unrelated bookkeeping this test must not conflate
+       with whether truncating hugeshrink.bin's own content gives its
+       blocks back. */
+    uint64 baseline = sfsFreeDataBlocks();
+    KT_GT(t, baseline, 0);
+
+    #define sfsShrinkSpanBlocks 8
+    #define sfsShrinkStartBlock 136
+    #define sfsShrinkSpan (sfsShrinkSpanBlocks * sfsBlockSize)
+    uint8* chunk = (uint8*)kmalloc(sfsShrinkSpan);
+    KT_NOTNULL(t, chunk);
+    if (!chunk)
+        return;
+    memset(chunk, 0x91, sfsShrinkSpan);
+    uint64 offset = (uint64)sfsShrinkStartBlock * sfsBlockSize;
+    KT_EQ(t, sfsWriteAt(f, offset, chunk, sfsShrinkSpan), sfsShrinkSpan);
+    kfree(chunk);
+    #undef sfsShrinkSpan
+    #undef sfsShrinkStartBlock
+    #undef sfsShrinkSpanBlocks
+
+    /* This file now owns: 10 direct + 1 single-indirect holder + 128
+       single-indirect data blocks + 1 double-indirect holder + 1 inner
+       indirect holder + a handful of double-indirect data blocks. Every
+       one of those must come back. */
+    KT_LT(t, sfsFreeDataBlocks(), baseline);
+
+    KT_TRUE(t, sfsTruncate(f, 0));
+    KT_EQ(t, sfsSizeOf(f), 0);
+    KT_EQU(t, sfsFreeDataBlocks(), baseline);
+
+    /* And the inode itself must still be usable afterward, not left in some
+       half-truncated state. */
+    KT_EQ(t, sfsWriteAt(f, 0, "reused", 6), 6);
+    KT_EQ(t, sfsSizeOf(f), 6);
+}
+
+KTEST(sfsFileGrowsThroughTripleIndirectBlock)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("huger.bin");
+    KT_TRUE(t, f > 0);
+
+    /* sfsDirectBlocks (10) + sfsPtrsPerBlock (128) + sfsPtrsPerBlock^2
+       (16384) = 16522 logical blocks are reachable through direct + single
+       + double indirect addressing; block 16522 onward can only be reached
+       through the triple indirect block added in this wave. Physically
+       reaching that boundary with real writes from offset 0 would mean
+       sfsWriteAt zero-filling ~8 MiB of real leading blocks first (its own
+       "no sparse holes" contract, see its doc comment) -- correct, but far
+       too slow for a headless boot-time gate. sfsTruncate's own grow path
+       is a genuine sparse hole instead (see sfsTruncateInode: growing only
+       ever rewrites the size field, no block is touched), the same
+       lseek-past-EOF-then-write shape a real filesystem's holes have -- so
+       pre-growing with it reaches the boundary for free, in O(1), then a
+       real write of a handful of blocks exercises the actual double/triple
+       crossing without paying for the untouched blocks in between. */
+    #define sfsTripleBoundaryBlock 16522
+    #define sfsTripleSpanBlocks 12
+    #define sfsTripleStartBlock (sfsTripleBoundaryBlock - 6)
+    #define sfsTripleSpan (sfsTripleSpanBlocks * sfsBlockSize)
+    uint64 startOffset = (uint64)sfsTripleStartBlock * sfsBlockSize;
+    KT_TRUE(t, sfsTruncate(f, startOffset));
+    KT_EQ(t, sfsSizeOf(f), startOffset);
+
+    uint8* pattern = (uint8*)kmalloc(sfsTripleSpan);
+    uint8* verify = (uint8*)kmalloc(sfsTripleSpan);
+    KT_NOTNULL(t, pattern);
+    KT_NOTNULL(t, verify);
+    if (!pattern || !verify) {
+        kfree(pattern);
+        kfree(verify);
+        return;
+    }
+    for (int i = 0; i < sfsTripleSpan; i++)
+        pattern[i] = (uint8)(i * 29 + 7);
+
+    /* Six blocks land in the double-indirect region (16516..16521), the
+       other six only exist through the new triple-indirect block
+       (16522..16527) -- one write straddles both. */
+    KT_EQ(t, sfsWriteAt(f, startOffset, pattern, sfsTripleSpan), sfsTripleSpan);
+    KT_EQ(t, sfsSizeOf(f), startOffset + sfsTripleSpan);
+
+    memset(verify, 0, sfsTripleSpan);
+    KT_EQ(t, sfsReadAt(f, startOffset, verify, sfsTripleSpan), sfsTripleSpan);
+    KT_EQ(t, memcmp(verify, pattern, sfsTripleSpan), 0);
+
+    /* Patch a window straddling the double-indirect/triple-indirect
+       boundary itself (logical block 16521/16522) -- same "boundary patch"
+       shape as sfsFileGrowsThroughDoubleIndirectBlock, one level deeper. */
+    uint8 patch[48];
+    memset(patch, 0xAB, sizeof(patch));
+    uint64 patchOffset = (uint64)sfsTripleBoundaryBlock * sfsBlockSize - 24;
+    KT_EQ(t, sfsWriteAt(f, patchOffset, patch, sizeof(patch)), (int64)sizeof(patch));
+
+    KT_EQ(t, sfsReadAt(f, startOffset, verify, sfsTripleSpan), sfsTripleSpan);
+    uint64 patchInSpan = patchOffset - startOffset;
+    KT_EQ(t, memcmp(verify + patchInSpan, patch, sizeof(patch)), 0);
+    KT_EQ(t, memcmp(verify, pattern, patchInSpan), 0);
+
+    kfree(pattern);
+    kfree(verify);
+    #undef sfsTripleSpan
+    #undef sfsTripleStartBlock
+    #undef sfsTripleSpanBlocks
+    #undef sfsTripleBoundaryBlock
+}
+
+KTEST(sfsTruncateFreesTripleIndirectBlocks)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("hugershrink.bin");
+    KT_TRUE(t, f > 0);
+
+    /* Baseline taken after creating the file, same reasoning as
+       sfsTruncateFreesDoubleIndirectBlocks: the root directory's own data
+       block is unrelated bookkeeping this test must not conflate with
+       hugershrink.bin's own content. */
+    uint64 baseline = sfsFreeDataBlocks();
+    KT_GT(t, baseline, 0);
+
+    /* Grow straight to the triple-indirect boundary via sfsTruncate (O(1),
+       a genuine sparse hole -- see sfsFileGrowsThroughTripleIndirectBlock
+       above) and write ENTIRELY inside the triple-indirect region, never
+       touching a single/double-indirect block. That keeps inode->indirect
+       and inode->doubleIndirect at 0, so the shrink-to-0 below only ever
+       does a cheap in-memory "still unallocated" check across the whole
+       single+double logical range instead of re-reading real holder blocks
+       for it -- proportional to the actual work, not to how far into the
+       address space the file happens to reach. */
+    #define sfsTripleBoundaryBlock 16522
+    #define sfsShrink2SpanBlocks 8
+    #define sfsShrink2Span (sfsShrink2SpanBlocks * sfsBlockSize)
+    uint64 offset = (uint64)sfsTripleBoundaryBlock * sfsBlockSize;
+    KT_TRUE(t, sfsTruncate(f, offset));
+
+    uint8* chunk = (uint8*)kmalloc(sfsShrink2Span);
+    KT_NOTNULL(t, chunk);
+    if (!chunk)
+        return;
+    memset(chunk, 0x62, sfsShrink2Span);
+    KT_EQ(t, sfsWriteAt(f, offset, chunk, sfsShrink2Span), sfsShrink2Span);
+    kfree(chunk);
+    #undef sfsShrink2Span
+    #undef sfsShrink2SpanBlocks
+    #undef sfsTripleBoundaryBlock
+
+    /* This file now owns: 1 triple-indirect holder + 1 mid holder + 1
+       leaf-pointer holder + a handful of triple-indirect data blocks.
+       Every one of those must come back. */
+    KT_LT(t, sfsFreeDataBlocks(), baseline);
+
+    KT_TRUE(t, sfsTruncate(f, 0));
+    KT_EQ(t, sfsSizeOf(f), 0);
+    KT_EQU(t, sfsFreeDataBlocks(), baseline);
+
+    /* And the inode itself must still be usable afterward. */
+    KT_EQ(t, sfsWriteAt(f, 0, "reused", 6), 6);
+    KT_EQ(t, sfsSizeOf(f), 6);
+}
+
+KTEST(sfsHardlinkSharesInodeAndData)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("original.txt");
+    KT_TRUE(t, f > 0);
+    const char* msg = "shared bytes";
+    uint64 len = strlen(msg);
+    KT_EQ(t, sfsWriteAt(f, 0, msg, len), (int64)len);
+    KT_EQ(t, sfsLinkCountOf(f), 1);
+
+    int32 linked = sfsLink("original.txt", "alias.txt");
+    KT_EQ(t, linked, f);
+    KT_EQ(t, sfsLinkCountOf(f), 2);
+    KT_EQ(t, sfsLookup("alias.txt"), f);
+
+    /* A write through the alias must be visible through the original name:
+       they are not two files that happen to match, they are the same
+       inode. */
+    KT_EQ(t, sfsWriteAt(sfsLookup("alias.txt"), len, " too", 4), 4);
+    char back[32];
+    memset(back, 0, sizeof(back));
+    KT_EQ(t, sfsReadAt(f, 0, back, len + 4), (int64)(len + 4));
+    KT_EQ(t, memcmp(back, "shared bytes too", len + 4), 0);
+}
+
+KTEST(sfsHardlinkRejectsDirectoriesAndBadArguments)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateDir("adir") > 0);
+    KT_EQ(t, sfsLink("adir", "adiralias"), -1);
+
+    int32 f = sfsCreateFile("real.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsLink("does/not/exist.txt", "alias.txt"), -1);
+
+    KT_TRUE(t, sfsCreateFile("taken.txt") > 0);
+    KT_EQ(t, sfsLink("real.txt", "taken.txt"), -1);
+
+    /* None of the rejected attempts may have left a stray link count or
+       directory entry behind. */
+    KT_EQ(t, sfsLinkCountOf(f), 1);
+    KT_EQ(t, sfsLookup("alias.txt"), -1);
+}
+
+KTEST(sfsRemoveOneHardlinkKeepsOtherAlive)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("first.txt");
+    KT_TRUE(t, f > 0);
+    KT_EQ(t, sfsWriteAt(f, 0, "durable", 7), 7);
+    KT_TRUE(t, sfsLink("first.txt", "second.txt") > 0);
+
+    KT_TRUE(t, sfsRemove("first.txt"));
+    KT_EQ(t, sfsLookup("first.txt"), -1);
+
