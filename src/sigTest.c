@@ -155,3 +155,160 @@ KTEST(sigRaiseSigContOnNonStoppedTargetStillDeliversSignal)
     uint32 id = threadCreate("sigContNotStopped", noopThreadEntry);
     KT_NE(t, id, threadInvalidId);
 
+    /* Never stopped: SIGCONT here is a no-op at the process-state level
+       (real Unix: continuing an already-running process does nothing extra),
+       but the signal itself is still delivered -- an installed handler
+       still runs through the normal sigConsumePending scan regardless. */
+    KT_TRUE(t, sigRaise(id, sigCont));
+    KT_EQ(t, threadAt(id)->state, threadRunnable);
+    KT_TRUE(t, threadAt(id)->sigPending & (1ull << sigCont));
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigRaiseWakesSleepingOrBlockedTargetEarlyForADeliverableSignal)
+{
+    uint32 id = threadCreate("sigWakeSleeping", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    /* No handler installed: sigTerm's default disposition is Terminate,
+       which sigWouldDeliver treats as genuinely deliverable -- exactly the
+       user/eintrtarget.c scenario (a thread blocked on a condition that
+       will never naturally occur, recovered by an ORDINARY signal, not
+       threadKill's direct bypass). */
+    thread->state = threadSleeping;
+    KT_TRUE(t, sigRaise(id, sigTerm));
+    KT_EQ(t, thread->state, threadRunnable);
+
+    thread->state = threadBlocked;
+    KT_TRUE(t, sigRaise(id, sigTstp));
+    KT_EQ(t, thread->state, threadRunnable);
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigRaiseDoesNotWakeSleepingOrBlockedTargetForABlockedOrIgnoredSignal)
+{
+    uint32 id = threadCreate("sigNoWakeBlocked", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    /* sigUsr1 explicitly blocked: must not disturb the sleep at all, same
+       as real Unix -- a blocked signal cannot interrupt anything. */
+    sigProcMask(thread, sigMaskBlock, (1ull << sigUsr1));
+    thread->state = threadSleeping;
+    KT_TRUE(t, sigRaise(id, sigUsr1));
+    KT_EQ(t, thread->state, threadSleeping);
+    KT_TRUE(t, thread->sigPending & (1ull << sigUsr1));
+
+    /* sigChld's real-world default is Ignore -- dismissed outright, never
+       delivered, so it must not wake anything either. */
+    thread->state = threadBlocked;
+    KT_TRUE(t, sigRaise(id, sigChld));
+    KT_EQ(t, thread->state, threadBlocked);
+
+    /* An explicit sigHandlerIgnore on an otherwise-Terminate signal is the
+       same story. */
+    sigSetHandler(thread, sigUsr2, sigHandlerIgnore, 0, 0);
+    KT_TRUE(t, sigRaise(id, sigUsr2));
+    KT_EQ(t, thread->state, threadBlocked);
+
+    threadAt(id)->state = threadRunnable;
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigRaiseDoesNotEarlyWakeForSignalMaskedByActiveHandlersSaMask)
+{
+    /* The gap the two tests above do NOT cover: sigWouldDeliver (and
+       therefore threadWakeForSignal) reads thread->sigBlocked verbatim,
+       with no idea whether any given bit got there via an explicit
+       sigProcMask call (tested above) or via sigConsumePending's own
+       handler-entry union of sigHandlerMasks[signum] (the file comment's
+       per-signal sa_mask paragraph). This drives the SECOND path for real
+       -- actually entering a handler via sigConsumePending, not just
+       calling sigProcMask by hand -- to prove the early-wake mechanism
+       (FALA 16) genuinely respects a mask that arrived that way too, the
+       exact interaction FALA 19 flagged as unexamined before deferring
+       this whole topic. user/masktarget.c is this same scenario live: its
+       onUsr1 handler (sa_mask = sigHup's bit here, sigUsr2's there) blocks
+       on a real read WHILE the mask is active, so an early wake bug here
+       would hang it forever instead of just failing a check. */
+    uint32 id = threadCreate("sigMaskedNoEarlyWake", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+    Registers regs = makeUserRegs();
+    int signum = -1;
+
+    uint64 usr1Handler = 0x40009000ull;
+    sigSetHandler(thread, sigUsr1, usr1Handler, (1ull << sigHup), 0);
+    sigRaise(id, sigUsr1);
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeHandler);
+    KT_TRUE(t, thread->sigBlocked & (1ull << sigHup));
+
+    /* onUsr1 is now "running" (as far as this thread's own state is
+       concerned) and immediately blocks on something real, exactly like
+       user/masktarget.c's own userRead(goFd) call from inside its
+       handler. */
+    thread->state = threadBlocked;
+
+    /* sigHup is covered by onUsr1's sa_mask -- sigWouldDeliver must say no,
+       so threadWakeForSignal is never even called: the Blocked state (and
+       therefore whatever real wait this models) must survive completely
+       undisturbed, same as the explicit-sigProcMask case above. */
+    KT_TRUE(t, sigRaise(id, sigHup));
+    KT_EQ(t, thread->state, threadBlocked);
+    KT_TRUE(t, thread->sigPending & (1ull << sigHup));
+
+    /* Once onUsr1 genuinely returns (sigOnSigReturn, restoring sigBlocked
+       to what it was before -- no sigHup bit), the deferred sigHup is
+       deliverable again, but this thread is STILL Blocked (the read it was
+       modelling has not itself completed) -- sigOnSigReturn only unmasks,
+       it is not itself a wake source, so nothing here should move the
+       thread back to Runnable behind the scheduler's own back. */
+    KT_TRUE(t, sigOnSigReturn(thread, &regs));
+    KT_FALSE(t, thread->sigBlocked & (1ull << sigHup));
+    KT_EQ(t, thread->state, threadBlocked);
+
+    threadAt(id)->state = threadRunnable;
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigRaiseNeverWakesAStoppedTargetForAnOrdinarySignal)
+{
+    uint32 id = threadCreate("sigStoppedNoWake", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+
+    KT_TRUE(t, threadStop(id));
+    KT_EQ(t, threadAt(id)->state, threadStopped);
+
+    /* sigTerm would genuinely deliver against a Runnable/Sleeping/Blocked
+       target (sigWouldDeliver says yes -- no handler, default Terminate,
+       not blocked) but job control's "stopped means stopped" invariant
+       must survive it existing at all: only threadContinue (an explicit
+       SIGCONT) may ever move a Stopped thread, exactly like real Unix
+       (a stopped process does not die of SIGTERM either, until continued
+       or SIGKILLed). */
+    KT_TRUE(t, sigRaise(id, sigTerm));
+    KT_EQ(t, threadAt(id)->state, threadStopped);
+    KT_TRUE(t, threadAt(id)->sigPending & (1ull << sigTerm));
+
+    KT_TRUE(t, threadKill(id));
+    KT_TRUE(t, threadReap(id));
+}
+
+KTEST(sigSetHandlerInstallsAndReturnsPreviousDisposition)
+{
+    uint32 id = threadCreate("sigHandlerTarget", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    KT_EQU(t, sigSetHandler(thread, sigUsr1, 0x40005000ull, 0, 0), sigHandlerDefault);
+    KT_EQU(t, thread->sigHandlers[sigUsr1], 0x40005000ull);
+
+    KT_EQU(t, sigSetHandler(thread, sigUsr1, sigHandlerIgnore, 0, 0), 0x40005000ull);
+    KT_EQU(t, thread->sigHandlers[sigUsr1], sigHandlerIgnore);
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
