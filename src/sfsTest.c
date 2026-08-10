@@ -468,3 +468,316 @@ KTEST(sfsPersistsMtimeAndCtimeAcrossUnmountRemount)
         return;
     KT_EQ(t, sfsWriteAt(f, 0, "persisted", 9), 9);
 
+    uint64 mtimeBefore = sfsMtimeOf(f);
+    uint64 ctimeBefore = sfsCtimeOf(f);
+    KT_GT(t, mtimeBefore, 0);
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    int32 reloaded = sfsLookup("timepersist.txt");
+    KT_EQ(t, reloaded, f);
+    KT_EQ(t, sfsMtimeOf(reloaded), mtimeBefore);
+    KT_EQ(t, sfsCtimeOf(reloaded), ctimeBefore);
+}
+
+/* Real chmod(2) owner rwx bits (fs.h's fsModeOwner*): createNode stamps a
+   type-based default (a file gets fsModeDefaultFile, a directory gets
+   fsModeDefaultDir), sfsChmod overwrites it and bumps ctime like any other
+   metadata-only mutation (sfsLink's linkCount bump does the same, see
+   above), and sfsModeOf/sfsChmod on an invalid inode number fail the same
+   way sfsSizeOf/sfsTypeOf already do for one. */
+KTEST(sfsModeDefaultsByTypeAndChmodBumpsCtime)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("modefile.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQ(t, sfsModeOf(f), fsModeDefaultFile);
+
+    int32 d = sfsCreateDir("modedir");
+    if (!KT_TRUE(t, d > 0))
+        return;
+    KT_EQ(t, sfsModeOf(d), fsModeDefaultDir);
+
+    uint64 ctimeBefore = sfsCtimeOf(f);
+    int64 before = rtcNow();
+    KT_TRUE(t, sfsChmod(f, 0400));
+    int64 after = rtcNow();
+
+    KT_EQ(t, sfsModeOf(f), 0400u);
+    KT_GE(t, sfsCtimeOf(f), ctimeBefore);
+    KT_GE(t, sfsCtimeOf(f), before);
+    KT_LE(t, sfsCtimeOf(f), after);
+
+    KT_EQ(t, sfsModeOf(-1), 0u);
+    KT_EQ(t, sfsModeOf(9999), 0u);
+    KT_FALSE(t, sfsChmod(-1, 0644));
+    KT_FALSE(t, sfsChmod(9999, 0644));
+}
+
+/* Same real point as sfsPersistsMtimeAndCtimeAcrossUnmountRemount above,
+   applied to mode: sfsUnmount() drops every in-memory structure, so an
+   exact match after sfsMount() proves the chmod'd value genuinely lives on
+   disk inside the inode, not in some cache that happens to survive. */
+KTEST(sfsPersistsModeAcrossUnmountRemount)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("modepersist.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_TRUE(t, sfsChmod(f, 0400));
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    int32 reloaded = sfsLookup("modepersist.txt");
+    KT_EQ(t, reloaded, f);
+    KT_EQ(t, sfsModeOf(reloaded), 0400u);
+}
+
+/* Real owner identity (fs.h's FbStat.uid, sched.h's currentThreadUid()):
+   createNode stamps every new node -- file, dir, symlink, fifo all go
+   through it, exactly like mtime/ctime already verified sufficient for
+   (FALA 39's own note) -- with whoever is CURRENT at creation time.
+   ktestRunAll always runs as the permanent idle thread (id 0, uid 0), the
+   same context schedTest.c's own uid-default tests already document
+   relying on, so both a freshly created file and the root inode itself
+   (sfsFormat, this test's own sfsFormat() call included) come back
+   root-owned. sfsUidOf on an invalid inode number fails the same way
+   sfsModeOf/sfsSizeOf/sfsTypeOf already do for one. */
+KTEST(sfsCreateNodeStampsCreatorUidAsOwner)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_EQU(t, sfsUidOf(sfsRootInode), 0u);
+
+    int32 f = sfsCreateFile("uidfile.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQU(t, sfsUidOf(f), 0u);
+
+    int32 d = sfsCreateDir("uiddir");
+    if (!KT_TRUE(t, d > 0))
+        return;
+    KT_EQU(t, sfsUidOf(d), 0u);
+
+    KT_EQU(t, sfsUidOf(-1), 0u);
+    KT_EQU(t, sfsUidOf(9999), 0u);
+}
+
+/* Same real point as sfsPersistsModeAcrossUnmountRemount above, applied to
+   uid: sfsUnmount() drops every in-memory structure, so an exact match
+   after sfsMount() proves ownership genuinely lives on disk inside the
+   inode, not in some cache that happens to survive. */
+KTEST(sfsPersistsUidAcrossUnmountRemount)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("uidpersist.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQU(t, sfsUidOf(f), 0u);
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    int32 reloaded = sfsLookup("uidpersist.txt");
+    KT_EQ(t, reloaded, f);
+    KT_EQU(t, sfsUidOf(reloaded), 0u);
+}
+
+/* Real chown(2)'s on-disk half (sfsChown): overwrites the inode's owner
+   uid outright and bumps ctime like sfsChmod's own metadata-only mutation
+   does -- same "bump ctime, invalid inode fails the same way" shape as
+   sfsModeDefaultsByTypeAndChmodBumpsCtime above. sfsChown itself has no
+   privilege check (vfsChown, vfs.c, is the real choke point that enforces
+   chown(2)'s root-only rule), so calling it directly here at any uid is
+   deliberately not restricted. */
+KTEST(sfsChownReassignsOwnerAndBumpsCtime)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("chownfile.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQU(t, sfsUidOf(f), 0u);
+
+    uint64 ctimeBefore = sfsCtimeOf(f);
+    int64 before = rtcNow();
+    KT_TRUE(t, sfsChown(f, 9001));
+    int64 after = rtcNow();
+
+    KT_EQU(t, sfsUidOf(f), 9001u);
+    KT_GE(t, sfsCtimeOf(f), ctimeBefore);
+    KT_GE(t, sfsCtimeOf(f), before);
+    KT_LE(t, sfsCtimeOf(f), after);
+
+    KT_FALSE(t, sfsChown(-1, 1000));
+    KT_FALSE(t, sfsChown(9999, 1000));
+}
+
+/* Same real point as sfsPersistsUidAcrossUnmountRemount above, but for a
+   uid REASSIGNED by sfsChown after creation, not just the creation-time
+   default -- proves the chown write path itself lands on disk, not just
+   that createNode's own initial stamp does. */
+KTEST(sfsPersistsChownedUidAcrossUnmountRemount)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("chownpersist.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_TRUE(t, sfsChown(f, 8123));
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    int32 reloaded = sfsLookup("chownpersist.txt");
+    KT_EQ(t, reloaded, f);
+    KT_EQU(t, sfsUidOf(reloaded), 8123u);
+}
+
+/* Real chgrp(2)'s on-disk half (sfsChgrp), mirroring
+   sfsChownReassignsOwnerAndBumpsCtime exactly one field over -- same "no
+   privilege check of its own, ctime bumps, invalid inode fails the same
+   way" shape. */
+KTEST(sfsChgrpReassignsGroupAndBumpsCtime)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("chgrpfile.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_EQU(t, sfsGidOf(f), 0u);
+
+    uint64 ctimeBefore = sfsCtimeOf(f);
+    int64 before = rtcNow();
+    KT_TRUE(t, sfsChgrp(f, 9002));
+    int64 after = rtcNow();
+
+    KT_EQU(t, sfsGidOf(f), 9002u);
+    KT_GE(t, sfsCtimeOf(f), ctimeBefore);
+    KT_GE(t, sfsCtimeOf(f), before);
+    KT_LE(t, sfsCtimeOf(f), after);
+
+    KT_FALSE(t, sfsChgrp(-1, 1000));
+    KT_FALSE(t, sfsChgrp(9999, 1000));
+}
+
+/* Same real point as sfsPersistsChownedUidAcrossUnmountRemount above, one
+   field over: proves the chgrp write path itself lands on disk. */
+KTEST(sfsPersistsChgrpedGidAcrossUnmountRemount)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    int32 f = sfsCreateFile("chgrppersist.txt");
+    if (!KT_TRUE(t, f > 0))
+        return;
+    KT_TRUE(t, sfsChgrp(f, 7124));
+
+    sfsUnmount();
+    KT_TRUE(t, sfsMount());
+
+    int32 reloaded = sfsLookup("chgrppersist.txt");
+    KT_EQ(t, reloaded, f);
+    KT_EQU(t, sfsGidOf(reloaded), 7124u);
+}
+
+/* Real directory-write enforcement at the on-disk choke point (sfs.c's
+   createNode, shared by sfsCreateFile/sfsCreateDir/sfsCreateFifo/
+   sfsCreateSymlink) -- mirrors coreTest.c's tmpfs
+   coreVfsMkdirAndCreateRequireParentWrite for the SFS backing store.
+   ktestRunAll always runs as uid 0, and vfsPermitted has no uid-0 bypass,
+   so removing the parent's own owner-write bit denies even its own
+   creator/owner. */
+KTEST(sfsCreateNodeRequiresParentWrite)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateDir("dwparent") > 0);
+    KT_TRUE(t, sfsChmod(sfsLookup("dwparent"), 0555));   /* r-x, no owner-write */
+
+    KT_EQ(t, sfsCreateFile("dwparent/f"), -1);
+    KT_EQ(t, sfsCreateDir("dwparent/sub"), -1);
+
+    KT_TRUE(t, sfsChmod(sfsLookup("dwparent"), fsModeDefaultDir));
+    KT_TRUE(t, sfsCreateFile("dwparent/f") > 0);
+    KT_TRUE(t, sfsCreateDir("dwparent/sub") > 0);
+}
+
+/* Same parent-write rule applied to sfsLink -- adding a new hardlink NAME
+   is a directory-entry creation exactly like sfsCreateFile, so it needs
+   write permission on the PARENT of the new name, not any permission on
+   the existing target being linked to. */
+KTEST(sfsLinkRequiresParentWriteOnNewName)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateFile("lwtarget.txt") > 0);
+    KT_TRUE(t, sfsCreateDir("lwparent") > 0);
+    KT_TRUE(t, sfsChmod(sfsLookup("lwparent"), 0555));
+
+    KT_EQ(t, sfsLink("lwtarget.txt", "lwparent/alias"), -1);
+
+    KT_TRUE(t, sfsChmod(sfsLookup("lwparent"), fsModeDefaultDir));
+    KT_TRUE(t, sfsLink("lwtarget.txt", "lwparent/alias") > 0);
+}
+
+/* Real unlink(2)/rmdir(2) semantics at the on-disk choke point (sfs.c's
+   sfsRemove) -- mirrors coreTest.c's tmpfs
+   coreVfsUnlinkAndRmdirRequireParentWrite: removing an entry needs write
+   permission on the PARENT, never the entry's own mode. */
+KTEST(sfsRemoveRequiresParentWrite)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateDir("rwparent") > 0);
+    KT_TRUE(t, sfsCreateFile("rwparent/f") > 0);
+
+    KT_TRUE(t, sfsChmod(sfsLookup("rwparent"), 0555));
+    KT_FALSE(t, sfsRemove("rwparent/f"));
+
+    KT_TRUE(t, sfsChmod(sfsLookup("rwparent"), fsModeDefaultDir));
+    KT_TRUE(t, sfsRemove("rwparent/f"));
+}
+
+/* Real POSIX search permission at the on-disk choke point (sfs.c's
+   lookupFrom, checked on every directory ANCESTOR a path walks through) --
+   mirrors coreTest.c's tmpfs coreVfsLookupRequiresAncestorExec. Removing
+   the exec bit on an ancestor makes every lookup THROUGH it fail even
+   though the target inode itself never changed. */
+KTEST(sfsLookupRequiresAncestorExec)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
+    KT_TRUE(t, sfsCreateDir("xancestor") > 0);
+    int32 leaf = sfsCreateFile("xancestor/leaf");
+    KT_TRUE(t, leaf > 0);
+
+    KT_TRUE(t, sfsChmod(sfsLookup("xancestor"), 0600));   /* rw-, no exec */
+    KT_EQ(t, sfsLookup("xancestor/leaf"), -1);
+
+    KT_TRUE(t, sfsChmod(sfsLookup("xancestor"), fsModeDefaultDir));
+    KT_EQ(t, sfsLookup("xancestor/leaf"), leaf);
+}
+
+KTEST(sfsSymlinkResolvesToTargetFile)
+{
+    if (!KT_TRUE(t, sfsFormat()))
+        return;
+
