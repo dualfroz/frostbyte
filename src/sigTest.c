@@ -312,3 +312,164 @@ KTEST(sigSetHandlerInstallsAndReturnsPreviousDisposition)
     KT_TRUE(t, threadDiscard(id));
 }
 
+KTEST(sigSetHandlerRejectsSigKillAndOutOfRangeSignum)
+{
+    uint32 id = threadCreate("sigHandlerBad", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    KT_EQU(t, sigSetHandler(thread, sigKill, 0x40005000ull, 0, 0), sigSetFailed);
+    KT_EQU(t, thread->sigHandlers[sigKill], sigHandlerDefault);
+
+    KT_EQU(t, sigSetHandler(thread, 0, 0x40005000ull, 0, 0), sigSetFailed);
+    KT_EQU(t, sigSetHandler(thread, sigMaxSignals, 0x40005000ull, 0, 0), sigSetFailed);
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigSetHandlerRejectsSigStopTooLikeRealEinval)
+{
+    uint32 id = threadCreate("sigStopHandlerBad", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    KT_EQU(t, sigSetHandler(thread, sigStop, 0x40005000ull, 0, 0), sigSetFailed);
+    KT_EQU(t, thread->sigHandlers[sigStop], sigHandlerDefault);
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigSetHandlerStoresMaskStrippedOfSigKillAndSigStop)
+{
+    uint32 id = threadCreate("sigMaskStoreTarget", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    sigSetHandler(thread, sigUsr1, 0x40005000ull,
+                  (1ull << sigUsr2) | (1ull << sigKill) | (1ull << sigStop), 0);
+    KT_EQU(t, thread->sigHandlerMasks[sigUsr1], (1ull << sigUsr2));
+
+    /* Installing a handler for a DIFFERENT signum must not disturb sigUsr1's
+       own stored mask -- sigHandlerMasks[] is indexed by the signal being
+       handled, one independent slot per signal number, same as
+       sigHandlers[] itself already is. */
+    sigSetHandler(thread, sigTerm, 0x40006000ull, (1ull << sigHup), 0);
+    KT_EQU(t, thread->sigHandlerMasks[sigUsr1], (1ull << sigUsr2));
+    KT_EQU(t, thread->sigHandlerMasks[sigTerm], (1ull << sigHup));
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigProcMaskBlockUnblockSetMaskReturnPreviousAndStripSigKill)
+{
+    uint32 id = threadCreate("sigMaskTarget", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+
+    KT_EQU(t, sigProcMask(thread, sigMaskBlock, (1ull << sigUsr1)), 0ull);
+    KT_EQU(t, thread->sigBlocked, (1ull << sigUsr1));
+
+    KT_EQU(t, sigProcMask(thread, sigMaskBlock, (1ull << sigUsr2)),
+           (1ull << sigUsr1));
+    KT_EQU(t, thread->sigBlocked, (1ull << sigUsr1) | (1ull << sigUsr2));
+
+    KT_EQU(t, sigProcMask(thread, sigMaskUnblock, (1ull << sigUsr1)),
+           (1ull << sigUsr1) | (1ull << sigUsr2));
+    KT_EQU(t, thread->sigBlocked, (1ull << sigUsr2));
+
+    KT_EQU(t, sigProcMask(thread, sigMaskSetMask, (1ull << sigTerm)),
+           (1ull << sigUsr2));
+    KT_EQU(t, thread->sigBlocked, (1ull << sigTerm));
+
+    /* sigKill can never be blocked, matching real Unix: its bit is
+       silently stripped from whatever mask is passed in, for BOTH
+       sigMaskBlock and sigMaskSetMask. */
+    KT_EQU(t, sigProcMask(thread, sigMaskSetMask, sigAllBlocked), (1ull << sigTerm));
+    KT_FALSE(t, thread->sigBlocked & (1ull << sigKill));
+    /* sigStop can never be blocked either, same treatment as sigKill. */
+    KT_FALSE(t, thread->sigBlocked & (1ull << sigStop));
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigConsumePendingReturnsNoneWhenNothingIsPendingOrEverythingIsBlocked)
+{
+    uint32 id = threadCreate("sigConsumeNone", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+    Registers regs = makeUserRegs();
+    int signum = -1;
+
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeNone);
+    KT_EQ(t, signum, -1);
+
+    sigRaise(id, sigUsr1);
+    sigProcMask(thread, sigMaskBlock, (1ull << sigUsr1));
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeNone);
+    /* Blocked, not delivered: the pending bit must survive untouched for
+       whenever it eventually gets unblocked. */
+    KT_TRUE(t, thread->sigPending & (1ull << sigUsr1));
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigConsumePendingDismissesIgnoredSignalsAndKeepsScanning)
+{
+    uint32 id = threadCreate("sigConsumeIgnore", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+    Registers regs = makeUserRegs();
+    int signum = -1;
+
+    /* sigChld's real-world default disposition is Ignore -- with no
+       handler installed at all it must be silently dismissed, not
+       terminate the thread. */
+    sigRaise(id, sigChld);
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeNone);
+    KT_FALSE(t, thread->sigPending & (1ull << sigChld));
+
+    /* An explicit sigHandlerIgnore dismisses a signal whose default would
+       otherwise be Terminate. */
+    sigSetHandler(thread, sigUsr1, sigHandlerIgnore, 0, 0);
+    sigRaise(id, sigUsr1);
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeNone);
+    KT_FALSE(t, thread->sigPending & (1ull << sigUsr1));
+
+    /* An ignored signal must not mask a REAL one raised alongside it in the
+       same scan: sigHup (explicit sigHandlerIgnore here) sits at a LOWER
+       signal number than sigTerm (default Terminate, no handler), so the
+       scan hits the dismissed one first and must keep going instead of
+       stopping there. */
+    sigSetHandler(thread, sigHup, sigHandlerIgnore, 0, 0);
+    sigRaise(id, sigHup);
+    sigRaise(id, sigTerm);
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeTerminate);
+    KT_EQ(t, signum, sigTerm);
+    KT_FALSE(t, thread->sigPending & (1ull << sigHup));
+    KT_FALSE(t, thread->sigPending & (1ull << sigTerm));
+
+    KT_TRUE(t, threadDiscard(id));
+}
+
+KTEST(sigConsumePendingDefaultDispositionReturnsTerminate)
+{
+    uint32 id = threadCreate("sigConsumeTerm", noopThreadEntry);
+    KT_NE(t, id, threadInvalidId);
+    Thread* thread = threadAt(id);
+    Registers regs = makeUserRegs();
+    Registers before = regs;
+    int signum = -1;
+
+    sigRaise(id, sigTerm);
+    KT_EQ(t, sigConsumePending(thread, &regs, &signum), sigOutcomeTerminate);
+    KT_EQ(t, signum, sigTerm);
+    KT_FALSE(t, thread->sigPending & (1ull << sigTerm));
+
+    /* Terminate is reported, not carried out, here -- sigConsumePending has
+       no way to hand back a new rsp for a thread it just killed, so it
+       must not touch the trapframe at all; isr.c's deliverPendingSignals
+       is the one that actually calls threadExit. */
+    KT_EQU(t, regs.rip, before.rip);
+    KT_EQU(t, regs.rax, before.rax);
+    KT_EQU(t, thread->sigHandlerDepth, 0u);
+
