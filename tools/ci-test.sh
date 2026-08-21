@@ -205,6 +205,128 @@ for needle in \
     "stderrwriter exited with code 0" \
     "stderrreader: reading redirected stdin" \
     "stderrreader: payload-ok" \
+    "stderrreader exited with code 0" \
+    "typing shell command for the here-string demo" \
+    "herestest: reading redirected stdin" \
+    "herestest: payload-ok" \
+    "herestest exited with code 0" \
+    "typing shell command for the here-string pipeline demo" \
+    "hcat: reading here-string stdin" \
+    "hcat: forwarded payload" \
+    "hsink: blocking on read, waiting for hcat" \
+    "hsink: payload-ok" \
+    "hcat | hsink exited with code 0" \
+    "typing shell command for the three-stage pipeline demo" \
+    "pipecat: reading piped stdin" \
+    "pipecat: forwarded payload" \
+    "pipesrc | pipecat | pipesink exited with code 0" \
+    "cwdtest: chdir-cwda-ok" \
+    "cwdtest: relative-write-cwda-ok" \
+    "cwdtarget: inherited-cwd-ok" \
+    "cwdtarget: relative-write-cwdb-ok" \
+    "cwdtest: parent-cwd-unaffected-ok" \
+    "cwdtest: isolation-verified-ok" \
+    "typing shell commands for the environment variable demo" \
+    "envprint: inherited-ok GREETING=frostbyte" \
+    "envprint: self-set-ok GREETING=child-mutated" \
+    "envprint: unset-ok" \
+    "envprint: unset-missing-ok" \
+    "envprint exited with code 0" \
+    "env: GREETING=frostbyte" \
+    "nicetest: bogus-pid-rejected-ok" \
+    "nicetest: zero-weight-rejected-ok" \
+    "nicetest: self-renice-ok" \
+    "nicetarget: reniced-while-sleeping-ok" \
+    "nicetest: other-renice-ok" \
+    "nicetest: reaped-pid-rejected-ok" \
+    "nicetest: priority-syscalls-ok" \
+    "date: printed-ok" \
+    "date: roundtrip-ok" \
+    "typing shell commands for the wildcard glob demo" \
+    "globcat: got 2 files" \
+    "globcat: /tmp/gd/a.txt=a" \
+    "globcat: /tmp/gd/b.txt=b" \
+    "timetest: create-stamped-ok" \
+    "timetest: write-stamped-ok" \
+    "timetest: hardlink-shares-mtime-ok" \
+    "timetest: PASS" \
+    "rmtest: tmpfs-reject-ok" \
+    "rmtest: tmpfs-remove-ok" \
+    "rmtest: sfs-reject-ok" \
+    "rmtest: sfs-remove-ok" \
+    "rmtest: PASS" \
+    "permtest: default-mode-ok" \
+    "permtest: write-denied-ok" \
+    "permtest: write-restored-ok" \
+    "permtest: copy-not-executable-ok" \
+    "permtest: exec-denied-ok" \
+    "permtest: exec-after-chmod-ok" \
+    "permtest: PASS" \
+    "identtest: root-by-default-ok" \
+    "identtest: owner-root-ok" \
+    "identtest: owner-write-ok-before-drop" \
+    "identtest: owner-exec-ok-before-drop" \
+    "identtest: chown-root-ok" \
+    "identtest: drop-to-1000-ok" \
+    "identtest: cannot-regain-root-ok" \
+    "identtest: setuid-self-noop-ok" \
+    "identtest: write-denied-non-owner-ok" \
+    "identtest: exec-denied-non-owner-ok" \
+    "identtest: chmod-nonowner-denied-ok" \
+    "identtest: chown-nonroot-denied-ok" \
+    "identtest: chmod-owner-after-drop-ok" \
+    "identtest: chown-owner-nonroot-denied-ok" \
+    "identtest: PASS" \
+    "dirpermtest: setup-ok" \
+    "dirpermtest: root-self-write-denied-ok" \
+    "dirpermtest: drop-to-1000-ok" \
+    "dirpermtest: parent-write-denied-ok" \
+    "dirpermtest: other-write-allowed-ok" \
+    "dirpermtest: other-unlink-allowed-ok" \
+    "dirpermtest: traverse-denied-ok" \
+    "dirpermtest: traverse-allowed-ok" \
+    "dirpermtest: list-denied-ok" \
+    "dirpermtest: search-without-list-ok" \
+    "dirpermtest: owner-write-allowed-ok" \
+    "dirpermtest: PASS" \
+    "grouptest: root-by-default-ok" \
+    "grouptest: fresh-file-gid-stamped-ok" \
+    "grouptest: chgrp-root-arbitrary-ok" \
+    "grouptest: setgid-root-arbitrary-ok" \
+    "grouptest: drop-to-6000-7000-ok" \
+    "grouptest: setgid-nonroot-denied-ok" \
+    "grouptest: setgid-self-noop-ok" \
+    "grouptest: group-read-allowed-ok" \
+    "grouptest: group-write-denied-ok" \
+    "grouptest: other-fallback-denied-ok" \
+    "grouptest: group-exec-allowed-ok" \
+    "grouptest: group-exec-denied-ok" \
+    "grouptest: chgrp-owner-self-gid-ok" \
+    "grouptest: chgrp-owner-arbitrary-denied-ok" \
+    "grouptest: chgrp-nonowner-nonroot-denied-ok" \
+    "grouptest: PASS" \
+    "pidfdtest: bad-target rejected" \
+    "pidfdtest: pidfd-open-ok" \
+    "pidfdtest: pidfd-send-ok" \
+    "pidfdtest: pidfd-wait-ok" \
+    "pidfdtest: reaped-target-detected-ok" \
+    "pidfdtest: PASS" \
+    "mmaptest: anon-zero-fill-ok" \
+    "mmaptest: anon-write-read-ok" \
+    "mmaptest: anon-munmap-ok" \
+    "mmaptest: file-map-content-ok" \
+    "mmapprotvictim: read-ok" \
+    "mmaptest: protection-sigsegv-ok" \
+    "mmaptest: exec-allowed-ok" \
+    "mmapexecvictim: write-ok" \
+    "mmaptest: exec-denied-sigsegv-ok" \
+    "mmaptest: PASS" \
+    "typing shell commands for the ls -l demo" \
+    "f 17 data.txt " \
+    "f 17 alias.txt " \
+    "f 17 data.txt 20" \
+    "typing shell commands for the &&/|| chaining demo" \
+    "ao2"
 do
     if grep -qF "$needle" "$log"; then
         echo "PASS: found '$needle'"
@@ -214,10 +336,32 @@ do
     fi
 done
 
+# In-kernel self-test battery (ktest). The summary line is machine-readable:
+#   "KTEST SUMMARY: <tests> tests, <checks> checks, <failures> failed"
+# The gate requires that line to exist, report 0 failures, and run at least
+# one test. A hung or crashing test suppresses the line and fails the gate.
+summary=$(grep -F "KTEST SUMMARY:" "$log" | tail -n 1)
+if [ -z "$summary" ]; then
+    echo "FAIL: no 'KTEST SUMMARY:' line (in-kernel tests did not complete)"
+    status=1
+else
+    echo "PASS: $summary"
+    tests=$(echo "$summary" | sed -n 's/.*: \([0-9]*\) tests.*/\1/p')
+    fails=$(echo "$summary" | sed -n 's/.* \([0-9]*\) failed.*/\1/p')
+    if [ "${tests:-0}" -lt 1 ]; then
+        echo "FAIL: ktest ran 0 tests"
+        status=1
+    fi
+    if [ "${fails:-1}" -ne 0 ]; then
+        echo "FAIL: ktest reported $fails failed check(s)"
+        status=1
+    fi
+fi
+
 rm -f "$log"
 if [ "$status" -eq 0 ]; then
-    echo "ci-test: all filesystem checks passed"
+    echo "ci-test: all boot and self-test checks passed"
 else
-    echo "ci-test: filesystem checks FAILED"
+    echo "ci-test: checks FAILED"
 fi
 exit $status
