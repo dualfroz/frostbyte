@@ -151,3 +151,130 @@ int main(void)
         return 1;
     }
 
+    /* --- real setgid(2): root may set its own gid to anything. --- */
+    if (userSetgid(7000) != 0) {
+        print("grouptest: FAIL root could not setgid(7000)\n");
+        return 1;
+    }
+    if (userGetgid() != 7000) {
+        print("grouptest: FAIL gid did not actually change to 7000\n");
+        return 1;
+    }
+    print("grouptest: setgid-root-arbitrary-ok\n");
+
+    /* --- real, permanent privilege drop: root becoming a plain uid, gid
+       already set above -- both credentials independent, matching real
+       Unix's separate uid/gid drop order. --- */
+    if (userSetuid(6000) != 0) {
+        print("grouptest: FAIL root could not setuid(6000)\n");
+        return 1;
+    }
+    if (userGetuid() != 6000 || userGetgid() != 7000) {
+        print("grouptest: FAIL identity after drop is not (6000,7000)\n");
+        return 1;
+    }
+    print("grouptest: drop-to-6000-7000-ok\n");
+
+    /* --- no way back: setgid is a one-way trapdoor too, same shape as
+       setuid's own cannot-regain-root-ok. --- */
+    if (userSetgid(9999) != -1) {
+        print("grouptest: FAIL non-root regained arbitrary gid via setgid\n");
+        return 1;
+    }
+    if (userGetgid() != 7000) {
+        print("grouptest: FAIL gid changed despite rejected setgid\n");
+        return 1;
+    }
+    print("grouptest: setgid-nonroot-denied-ok\n");
+
+    if (userSetgid(7000) != 0) {
+        print("grouptest: FAIL setgid to own current gid was rejected\n");
+        return 1;
+    }
+    print("grouptest: setgid-self-noop-ok\n");
+
+    /* --- the actual point of this fala: a caller that is NOT the owner
+       (uid 6000 vs 9000) but DOES share the file's group (7000) is
+       governed by the group bits, not other. groupOnly has ONLY
+       group-read set, so read succeeds and write fails. --- */
+    int rfd = (int)userOpen("/tmp/groupd/groupOnly", oReadOnly);
+    if (rfd < 0) {
+        print("grouptest: FAIL group-matching read denied\n");
+        return 1;
+    }
+    userClose(rfd);
+    print("grouptest: group-read-allowed-ok\n");
+
+    if (userOpen("/tmp/groupd/groupOnly", oWriteOnly) >= 0) {
+        print("grouptest: FAIL group-write succeeded without the bit\n");
+        return 1;
+    }
+    print("grouptest: group-write-denied-ok\n");
+
+    /* --- a caller matching NEITHER uid (6000 vs 9000) NOR gid (7000 vs
+       8000) must fall through to other, which mismatch also leaves
+       clear. --- */
+    if (userOpen("/tmp/groupd/mismatch", oReadOnly) >= 0) {
+        print("grouptest: FAIL non-member read succeeded via wrong branch\n");
+        return 1;
+    }
+    print("grouptest: other-fallback-denied-ok\n");
+
+    /* --- the same group model gates real exec, not just open(). --- */
+    long pid = userSpawn("/tmp/groupd/progOk", 0);
+    if (pid < 0) {
+        print("grouptest: FAIL group-exec spawn denied\n");
+        return 1;
+    }
+    if (userWait(pid) != 1) {
+        print("grouptest: FAIL group-exec spawned copy did not exit 1\n");
+        return 1;
+    }
+    print("grouptest: group-exec-allowed-ok\n");
+
+    if (userSpawn("/tmp/groupd/progDenied", 0) >= 0) {
+        print("grouptest: FAIL group-exec spawn succeeded across groups\n");
+        return 1;
+    }
+    print("grouptest: group-exec-denied-ok\n");
+
+    /* --- real chgrp(2) privilege: the owner (this process really does own
+       "owned" now, uid 6000) may set the group to its OWN current gid
+       (7000) -- but not to anything else, even though it owns the
+       file. --- */
+    if (userChgrp("/tmp/groupd/owned", 7000) != 0) {
+        print("grouptest: FAIL owner chgrp to own gid denied\n");
+        return 1;
+    }
+    if (userStat("/tmp/groupd/owned", &st) != 0 || st.gid != 7000) {
+        print("grouptest: FAIL owned gid not actually reassigned\n");
+        return 1;
+    }
+    print("grouptest: chgrp-owner-self-gid-ok\n");
+
+    if (userChgrp("/tmp/groupd/owned", 8000) != -1) {
+        print("grouptest: FAIL owner chgrp to arbitrary gid succeeded\n");
+        return 1;
+    }
+    if (userStat("/tmp/groupd/owned", &st) != 0 || st.gid != 7000) {
+        print("grouptest: FAIL owned gid changed by denied chgrp\n");
+        return 1;
+    }
+    print("grouptest: chgrp-owner-arbitrary-denied-ok\n");
+
+    /* --- a non-owner, non-root caller can never chgrp at all, even to its
+       own gid -- mismatch is owned by 9000, this process is neither owner
+       nor root. --- */
+    if (userChgrp("/tmp/groupd/mismatch", 7000) != -1) {
+        print("grouptest: FAIL non-owner non-root chgrp succeeded\n");
+        return 1;
+    }
+    if (userStat("/tmp/groupd/mismatch", &st) != 0 || st.gid != 8000) {
+        print("grouptest: FAIL mismatch gid changed by denied chgrp\n");
+        return 1;
+    }
+    print("grouptest: chgrp-nonowner-nonroot-denied-ok\n");
+
+    print("grouptest: PASS\n");
+    return 0;
+}
