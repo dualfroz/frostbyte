@@ -153,3 +153,99 @@ int main(void)
     }
     print("identtest: drop-to-1000-ok\n");
 
+    /* --- there is no way back: this is a one-way trapdoor, not a toggle. --- */
+    if (userSetuid(0) != -1) {
+        print("identtest: FAIL non-root regained root via setuid\n");
+        return 1;
+    }
+    if (userGetuid() != 1000) {
+        print("identtest: FAIL uid changed despite rejected setuid\n");
+        return 1;
+    }
+    print("identtest: cannot-regain-root-ok\n");
+
+    /* --- setting your own current uid is always a no-op success, exactly
+       like real setuid(getuid()). --- */
+    if (userSetuid(1000) != 0) {
+        print("identtest: FAIL setuid to own current uid was rejected\n");
+        return 1;
+    }
+    print("identtest: setuid-self-noop-ok\n");
+
+    /* --- now a non-owner (uid 1000 against a uid-0-owned file): the
+       owner-only 0600 mode has no other-write bit, so this write must be
+       refused, even though this exact process wrote the same file
+       successfully moments ago as its owner. --- */
+    if (userOpen("/tmp/identd/secret.txt", oWriteOnly) >= 0) {
+        print("identtest: FAIL write succeeded after dropping ownership\n");
+        return 1;
+    }
+    print("identtest: write-denied-non-owner-ok\n");
+
+    /* --- same story for exec: owner-exec-only, no other-exec, so the
+       exact same binary this process spawned successfully as root now
+       refuses to spawn at all. --- */
+    if (userSpawn("/tmp/identd/prog", 0) >= 0) {
+        print("identtest: FAIL spawn succeeded after dropping ownership\n");
+        return 1;
+    }
+    print("identtest: exec-denied-non-owner-ok\n");
+
+    /* --- real, previously-missing enforcement: before this fala, chmod had
+       no ownership check at all, so ANY uid could chmod ANY file. Now that
+       vfsChmod refuses a non-owner, non-root caller, this must fail against
+       secret.txt (owned by root, this process is neither the owner nor
+       root anymore) -- and the mode must be left completely unchanged. --- */
+    if (userChmod("/tmp/identd/secret.txt", 0666) != -1) {
+        print("identtest: FAIL non-owner chmod succeeded on secret.txt\n");
+        return 1;
+    }
+    if (userStat("/tmp/identd/secret.txt", &st) != 0 || st.mode != 0600) {
+        print("identtest: FAIL secret.txt mode changed by denied chmod\n");
+        return 1;
+    }
+    print("identtest: chmod-nonowner-denied-ok\n");
+
+    /* --- chown is root-only, full stop -- not even trying to chown a file
+       this process does not own is any different from trying on one it
+       does (see chown-owner-nonroot-denied-ok below): both are refused for
+       the exact same reason, non-root. secret.txt's uid must stay 0. --- */
+    if (userChown("/tmp/identd/secret.txt", 1000) != -1) {
+        print("identtest: FAIL non-root chown succeeded on secret.txt\n");
+        return 1;
+    }
+    if (userStat("/tmp/identd/secret.txt", &st) != 0 || st.uid != 0) {
+        print("identtest: FAIL secret.txt uid changed by denied chown\n");
+        return 1;
+    }
+    print("identtest: chown-nonroot-denied-ok\n");
+
+    /* --- owned.txt was chown'd to 1000 above, so THIS process (now uid
+       1000) really is its owner -- chmod does not require root, only
+       ownership, so this must succeed even after the privilege drop. --- */
+    if (userChmod("/tmp/identd/owned.txt", 0644) != 0) {
+        print("identtest: FAIL owner chmod denied on owned.txt after drop\n");
+        return 1;
+    }
+    if (userStat("/tmp/identd/owned.txt", &st) != 0 || st.mode != 0644) {
+        print("identtest: FAIL owned.txt mode not actually changed\n");
+        return 1;
+    }
+    print("identtest: chmod-owner-after-drop-ok\n");
+
+    /* --- but chown is root-only even for your OWN file: real Unix's
+       _POSIX_CHOWN_RESTRICTED default means an owner cannot give a file
+       away either. owned.txt's uid must stay 1000. --- */
+    if (userChown("/tmp/identd/owned.txt", 0) != -1) {
+        print("identtest: FAIL owner chown succeeded without being root\n");
+        return 1;
+    }
+    if (userStat("/tmp/identd/owned.txt", &st) != 0 || st.uid != 1000) {
+        print("identtest: FAIL owned.txt uid changed by denied chown\n");
+        return 1;
+    }
+    print("identtest: chown-owner-nonroot-denied-ok\n");
+
+    print("identtest: PASS\n");
+    return 0;
+}
