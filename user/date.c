@@ -1,31 +1,10 @@
 #include "ulib.h"
 
-/*
- * Real ring-3 "date": the first live demo of rtc.c/sysTime's wall-clock
- * time, spawned directly by kmain.c at boot exactly like nicetest.c above
- * it -- fully synchronous, no injected keystroke or pipe rendezvous, so
- * unlike most of this kernel's live demos this one has no scheduling-
- * timing race to flake on at all.
- *
- * Deliberately duplicates (not shares) Howard Hinnant's civil-calendar
- * algorithm rtc.c already uses: this file writes its OWN forward
- * (civil -> epoch) and inverse (epoch -> civil) implementations from
- * scratch, independent of the kernel side. Decoding the epoch userTime()
- * returns and then re-encoding it back with this independent forward
- * function must reproduce the exact same number, which proves this
- * program's own encode/decode pair is a true bijection over the date it
- * actually ran on -- a real, self-verifying round trip, not a print
- * nobody checks.
- */
-
 static void printErr(const char* text)
 {
     userWrite(2, text, stringLength(text));
 }
 
-/* Zero-padded unsigned decimal, `width` digits minimum (e.g. printPadded(7, 2)
-   -> "07"). Never negative here -- every field this file ever passes in is
-   already a non-negative calendar component. */
 static void printPadded(long value, int width)
 {
     char digits[16];
@@ -45,10 +24,6 @@ static void printPadded(long value, int width)
         userWrite(1, &digits[i], 1);
 }
 
-/* Howard Hinnant's days_from_civil -- forward direction, civil date to a
-   day count relative to 1970-01-01. See rtc.c for the same algorithm used
-   kernel-side; this copy is independent, not shared, on purpose (see file
-   header comment). */
 static long daysFromCivil(long y, long m, long d)
 {
     y -= (m <= 2) ? 1 : 0;
@@ -59,8 +34,6 @@ static long daysFromCivil(long y, long m, long d)
     return era * 146097 + doe - 719468;
 }
 
-/* Howard Hinnant's civil_from_days -- the inverse direction, a day count
-   back to a civil date. */
 static void civilFromDays(long z, long* outYear, long* outMonth, long* outDay)
 {
     z += 719468;

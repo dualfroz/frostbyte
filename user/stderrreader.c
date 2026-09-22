@@ -1,18 +1,5 @@
 #include "ulib.h"
 
-/*
- * Companion to stderrwriter.c -- reads fd 0 (redirected by the shell to a
- * REAL file via `<`, jobctlApplyRedirects) in a loop until a real EOF,
- * exactly like redirreader.c does, then compares byte-for-byte against two
- * back-to-back copies of stderrwriter.c's own payload -- proof that `2>`
- * (create/truncate) followed by `2>>` (append) on the SAME path produced
- * exactly that file, not a truncated/duplicated/reordered one.
- *
- * This process's own fd 1 (stdout) is NOT redirected -- print() (ulib.h)
- * reaches the real console exactly like any unredirected demo, so the
- * needle below is exactly as observable to ci-test.sh as every other one.
- */
-
 static int streq(const char* a, const char* b)
 {
     while (*a && *a == *b) {

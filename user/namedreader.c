@@ -1,21 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-spawned independently of namedwriter.c (see kmain.c's spawnUser
- * calls) -- unlike fiforeader.c/fifowriter.c, which fifomaster.c spawns as
- * its own children and hands a shared pipe.h handle to via argv, this
- * process and namedwriter.c have no relationship at all beyond both being
- * launched at boot: neither one's pid, argv, or fd table ever mentions the
- * other. The only thing they share is agreeing on the path "/tmp/rendezvous"
- * (mkfifo'd by kmain.c before either is spawned) -- proving vfsMkfifo/
- * vfsOpen (vfs.h) really do let two unrelated processes rendezvous purely
- * through the filesystem namespace, the gap FALA 11 explicitly left open.
- * Opens for read immediately, well before namedwriter.c's deliberate sleep
- * elapses, so the blocking read() below has to genuinely park across many
- * timer ticks and be woken later -- not just win a race against data that
- * was already sitting in the pipe.
- */
-
 #define namedPipePath "/tmp/rendezvous"
 
 static int streq(const char* a, const char* b)

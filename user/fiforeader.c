@@ -1,14 +1,5 @@
 #include "ulib.h"
 
-/*
- * Only ever spawned by fifomaster.c, with the shared pipe's handle number
- * as argv[1]. Attaches its end and immediately calls a blocking read() on
- * a pipe fifowriter.c (spawned alongside it, sleeping before it writes)
- * has not put anything into yet -- this call must genuinely park (the
- * syscall-restart path in syscall.c's sysRead, parked on pipeChannel) and
- * only return once fifowriter.c's write wakes it back up, not before.
- */
-
 static int streq(const char* a, const char* b)
 {
     while (*a && *a == *b) {

@@ -10,9 +10,6 @@ uint64 spinLockAcquire(SpinLock* lock)
 {
     uint64 flags = saveAndDisableInterrupts();
     while (__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE) != 0) {
-        /* single-core: a lock held across this spin can only be released by
-           an interrupt handler, but interrupts are off -- callers must never
-           acquire a lock they (or a handler nested under them) already hold */
     }
     return flags;
 }

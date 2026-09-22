@@ -48,11 +48,6 @@ uint32 pidfdTarget(int handle)
     PidfdEntry* p = pidfdAt(handle);
     if (!p)
         return threadInvalidId;
-    /* targetId was range/liveness-checked once, at pidfdOpen time, and
-       never changes afterward -- threadAt is safe here without repeating
-       that check. A mismatch means the slot has since been freed
-       (threadReap/threadDiscard's memset zeroes Thread.generation back to
-       0) or handed to an entirely different, unrelated thread. */
     if (threadAt(p->targetId)->generation != p->targetGeneration)
         return threadInvalidId;
     return p->targetId;

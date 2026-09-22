@@ -1,15 +1,5 @@
 #include "ulib.h"
 
-/*
- * Only ever spawned by fifomaster.c, with the shared pipe's handle number
- * as argv[1] (decToString'd -- see fifomaster.c). Sleeps well past when
- * fiforeader.c (spawned moments earlier) will already be parked in a
- * blocking read() on the still-empty pipe, so the write below has to
- * actually wake it back up (schedWakeChannel, pipeWrite in pipe.c) instead
- * of the reader simply finding data already waiting for it -- proof that
- * the block was real, not a lucky race.
- */
-
 #define fifoWriterDelayMs 200
 
 static const char* payload = "shared pipe payload";

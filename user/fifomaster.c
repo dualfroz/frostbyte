@@ -1,19 +1,5 @@
 #include "ulib.h"
 
-/*
- * Drives the shared-pipe demo added this wave (pipeCreateDetached/
- * pipeAddReader/pipeAddWriter, pipe.h; vfsPipeCreateHandle/vfsPipeAttach,
- * vfs.h; sysRead/sysWrite's retry-the-syscall path, syscall.c): creates one
- * detached pipe handle and hands it to two INDEPENDENTLY spawned processes
- * as a decimal argv string (decToString/parseDec, ulib.c) rather than a
- * shared fd -- frostbyte has no fork(), so a raw pipe.h handle number is
- * the only thing two unrelated processes can rendezvous on. fifowriter.c
- * deliberately sleeps before writing, so fiforeader.c's read() genuinely
- * has to block across several timer ticks and be woken later, not just win
- * a scheduling race against an already-full buffer -- see fifowriter.c/
- * fiforeader.c for how each end proves that on its own side.
- */
-
 int main(void)
 {
     print("fifomaster: start, pid=");

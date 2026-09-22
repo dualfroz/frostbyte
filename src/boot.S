@@ -81,10 +81,6 @@ checkLongMode:
     movl $0x80000001, %eax
     cpuid
 
-    /* Same cpuid leaf already gives us CPUID.80000001H:EDX.NX (bit 20) for
-       free -- stash it in cpuNxSupported (checked below, in %eax's later
-       rdmsr/wrmsr dance) before the LM (bit 29) test below, which does not
-       touch %edx, leaves it intact either way. */
     movl $0, cpuNxSupported
     testl $(1 << 20), %edx
     jz 1f

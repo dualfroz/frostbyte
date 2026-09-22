@@ -1,18 +1,5 @@
 #include "ulib.h"
 
-/*
- * Only ever spawned by stopchldtest.c, with two shared pipe handles as
- * argv[1] (the "ready" pipe, this process writes) and argv[2] (the "go"
- * pipe, this process reads) -- identical shape to user/jobtarget.c, reused
- * here so stopchldtest.c can stop/continue a target genuinely Blocked
- * mid-syscall while ALSO watching for the new SIGCHLD-on-stop/
- * SIGCHLD-on-continue notifications (sched.c's threadStop/threadContinue)
- * against itself, something jobtest.c/jobtarget.c never needed since
- * neither side there installs a sigChld handler. A distinct exit code (66,
- * not jobtarget.c's 55) keeps the two pairs' needles/asserts from ever
- * being confusable in the serial log.
- */
-
 int main(int argc, char** argv)
 {
     print("stopchldtarget: start, pid=");
@@ -46,12 +33,6 @@ int main(int argc, char** argv)
     print("stopchldtarget: ready, blocking on go pipe\n");
 
     char goByte = 0;
-    /* Real blocking read: parks this thread (threadBlocked) until a byte is
-       actually available. stopchldtest.c raises SIGSTOP against this exact
-       blocking read, waits for its own SIGCHLD-on-stop notification, writes
-       the byte, raises SIGCONT, waits for its own SIGCHLD-on-continue
-       notification, and only then this read can return -- the same
-       restart-syscall retry contract user/jobtarget.c already relies on. */
     if (userRead((int)goFd, &goByte, 1) != 1) {
         print("stopchldtarget: FAIL read go byte\n");
         return 1;

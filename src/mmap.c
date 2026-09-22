@@ -6,30 +6,6 @@
 #include "vfs.h"
 #include "string.h"
 
-/*
- * Real demand-paged mmap(2)/munmap(2) on top of this kernel's single
- * shared page table: a Vma only ever RESERVES address space (mmapReserve)
- * -- no physical frame is allocated and no file byte is read until the
- * very first access to a given page actually traps into isr.c's #PF
- * handler, which resolves it here (mmapFaultHandler). This is the same
- * "lazy" contract pagingMapUserRange's own eager sibling does NOT have
- * (that one maps and zeroes every page up front, for an ELF image/stack
- * that is about to be fully used anyway) -- mmap's whole point is a
- * mapping the caller may only ever touch a fraction of.
- *
- * Every mapping is placed inside the calling thread's own elfSlotSize
- * slot (elf.h), specifically the sub-range [userSlotBase +
- * elfSlotStackOffset, userSlotBase + elfSlotSize) -- everything from the
- * top of the small, fixed-size user stack up to the end of the slot, 128
- * MiB that no ELF LOAD segment or brk-growth ever reaches in this
- * kernel's own binaries (elfSlotBrkOffset caps brk's own growth at 64
- * MiB in, elfSlotStackOffset itself at 128 MiB in -- see elf.h). There is
- * no address-space-wide mmap arena the way a real kernel's own mm_struct
- * has one: with a single page table shared by every thread in the
- * system, "the whole address space" is not a per-thread concept to begin
- * with, so mmap here is scoped exactly the way brk/the stack already are.
- */
-
 static uint64 pageAlignDown(uint64 x)
 {
     return x & ~(uint64)(frameSize - 1);
@@ -83,11 +59,6 @@ static bool regionFree(struct Thread* thread, uint64 start, uint64 end)
     return true;
 }
 
-/* First-fit search for `length` free bytes inside thread's own mmap
-   region: candidate gaps are the region's own start plus every existing
-   Vma's own end, sorted into address order (a plain insertion sort --
-   maxVmasPerThread's small fixed bound makes anything fancier pointless),
-   then the first candidate `length` bytes actually fits at wins. */
 static uint64 findFreeRegion(struct Thread* thread, uint64 length)
 {
     uint64 regionStart = mmapRegionStart(thread);
@@ -173,10 +144,6 @@ bool mmapRelease(struct Thread* thread, uint64 addr, uint64 length)
     if (unmapEnd < unmapStart)
         return false;
 
-    /* Up-front check: refuse the WHOLE call if releasing this range would
-       need to split a Vma in the middle (touching neither end) and no free
-       slot exists to hold the resulting upper half. A thread's own Vmas
-       never overlap each other, so at most one can ever need splitting. */
     for (int i = 0; i < maxVmasPerThread; i++) {
         Vma* v = &thread->vmas[i];
         if (v->used && v->start < unmapStart && v->end > unmapEnd && !findFreeVmaSlot(thread))
