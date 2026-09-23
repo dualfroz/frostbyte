@@ -8,24 +8,8 @@
 #include "vfs.h"
 
 #define sfsDirectBlocks 10
-#define sfsPtrsPerBlock (sfsBlockSize / sizeof(uint32)) /* 128 */
+#define sfsPtrsPerBlock (sfsBlockSize / sizeof(uint32))
 
-/* 88 bytes: 512/88 = 5 inodes per block (72 bytes/block left unused --
-   inodeLocation and the format-time inodeTableBlocks math already derive
-   everything from sizeof(SfsInode) generically, so this shrinking density
-   is the honest cost of the extra fields, not a layout hack, same story as
-   84 bytes/6-per-block was before gid). Addressing is direct (10 blocks) +
-   single indirect (128 blocks) + double indirect (128 * 128 blocks) +
-   triple indirect (128 * 128 * 128 blocks): a max file size of roughly
-   (10 + 128 + 128*128 + 128*128*128) * 512 bytes ~= 1032 MiB, versus ~8 MiB
-   with direct/single/double alone. mtime/ctime (rtc.h's rtcNow(), seconds
-   since the Unix epoch, truncated to 32 bits -- valid through year 2106,
-   same honest scope as rtc.c's own 2000-2099 century limit), mode (fs.h's
-   fsModeOwner*, real chmod(2) bits), uid (fs.h's FbStat.uid, sched.h's
-   currentThreadUid() at creation) and now gid (fs.h's FbStat.gid, sched.h's
-   currentThreadGid() at creation) are the newest fields, genuinely growing
-   the struct like tripleIndirect did before them -- there is no padding
-   left to repurpose. */
 typedef struct SfsInode {
     uint32 type;
     uint32 size;
@@ -42,8 +26,6 @@ typedef struct SfsInode {
     uint32 gid;
 } SfsInode;
 
-/* Exactly 64 bytes: 512/64 = 8 directory entries per block. name[56] leaves
-   room for sfsNameMax (55) chars plus the null terminator. */
 typedef struct SfsDirEntry {
     uint32 inode;
     uint32 type;
@@ -65,20 +47,15 @@ typedef struct SfsSuperblock {
     uint32 rootInode;
 } SfsSuperblock;
 
-#define sfsMagic 0x53465331u /* "SFS1" */
+#define sfsMagic 0x53465331u
 
 static SfsSuperblock sb;
 static uint8* inodeBitmap = nullptr;
 static uint8* blockBitmap = nullptr;
 static bool isMounted = false;
 
-/* See sfsGeneration()'s doc comment (sfs.h). Starts at 1 (not 0) so a caller
-   that zero-initializes its own cache can use generation 0 to mean "never
-   bound to anything yet" without that ever colliding with a real one. */
 static uint64 formatGeneration = 1;
 
-/* --- internal helpers (forward-declared so definition order can follow the
-   dependency graph without header noise) --- */
 static bool bitTest(const uint8* map, uint32 bit);
 static void bitSet(uint8* map, uint32 bit);
 static void bitClear(uint8* map, uint32 bit);
@@ -163,15 +140,6 @@ static void inodeLocation(int32 inodeNum, uint32* blockAbs, uint32* index)
     *index = (uint32)inodeNum % perBlock;
 }
 
-/* Shared bound check for readInode/writeInodeRaw below: every REAL inode
-   number allocInodeNum ever hands out satisfies 1 <= n < sb.inodeCount (the
-   loop above never even considers slot 0, reserved as an eternal sentinel).
-   Every one of this file's own internal callers already passes a value it
-   got from allocInodeNum/sfsLookup/dirFind, so this never rejects a
-   legitimate call -- it exists to stop an out-of-range inodeNum (a caller
-   bug, or a deliberately-invalid probe like sfsModeOf(9999)) from silently
-   computing a block address past the real inode table and reading/writing
-   whatever data block happens to live there instead of failing cleanly. */
 static bool inodeNumInRange(int32 inodeNum)
 {
     return inodeNum > 0 && (uint32)inodeNum < sb.inodeCount;
@@ -244,12 +212,6 @@ static void freeDataBlockAbs(uint32 blockAbs)
     flushBlockBitmap();
 }
 
-/* Allocates (if needed) blockAbs's holderAbs on first use and returns the
-   holder block's contents in buf, zeroed for a fresh allocation. Shared by
-   the single-indirect and each level of the double-indirect path below, so
-   the "allocate a pointer block, zero it, write it back" dance is written
-   once. *holderAbs is updated (and inode->blockCount bumped) when a new
-   block is allocated. */
 static bool loadOrAllocPointerBlock(SfsInode* inode, uint32* holderAbs, uint8* buf)
 {
     if (*holderAbs == 0) {
@@ -340,15 +302,12 @@ static bool getOrAllocBlockForWrite(SfsInode* inode, uint32 logicalIndex, uint32
         return true;
     }
 
-    /* Same three-level shape as the double-indirect block above, one level
-       deeper: tripleIndirect -> top (128 mid-block pointers) -> mid (128
-       leaf-block pointers) -> leaf (128 data-block pointers) -> data. */
     uint32 tripleIndex = doubleIndex - sfsPtrsPerBlock * sfsPtrsPerBlock;
     uint32 topIndex = tripleIndex / (sfsPtrsPerBlock * sfsPtrsPerBlock);
     uint32 midIndex = (tripleIndex / sfsPtrsPerBlock) % sfsPtrsPerBlock;
     uint32 leafIndex = tripleIndex % sfsPtrsPerBlock;
     if (topIndex >= sfsPtrsPerBlock)
-        return false; /* past the addressing limit (~1 GiB) */
+        return false;
 
     uint8 topBuf[sfsBlockSize];
     if (!loadOrAllocPointerBlock(inode, &inode->tripleIndirect, topBuf))
@@ -599,16 +558,6 @@ static bool sfsTruncateInode(SfsInode* inode, int32 inodeNum, uint32 newSize)
         }
     }
 
-    /* Pointer-holder blocks themselves (the indirect block, every inner
-       indirect block plus the outer double-indirect block, and every
-       top/mid/leaf-pointer block of the triple-indirect chain) are
-       reclaimed all-or-nothing once nothing addressed through them is
-       needed anymore -- the loop above already frees every leaf data block
-       that was in range, so by this point each holder either still guards
-       live data (neededBlocks reaches into its range: leave it alone) or is
-       entirely spent (free it, and everything it pointed at). Checked
-       highest level first (triple, then double, then single) so a shrink
-       that drops the whole file frees every level in one pass. */
     if (neededBlocks <= sfsDirectBlocks + sfsPtrsPerBlock + sfsPtrsPerBlock * sfsPtrsPerBlock
             && inode->tripleIndirect != 0) {
         uint8 topBuf[sfsBlockSize];
@@ -780,9 +729,6 @@ static int32 createNode(const char* path, uint32 type)
     int32 parentInode = sfsLookup(parentBuf);
     if (parentInode < 0 || sfsTypeOf(parentInode) != sfsTypeDir)
         return -1;
-    /* Real Unix directory-write semantics: creating a NEW entry needs
-       write permission on the PARENT directory, mirroring vfs.c's
-       vfsMkdir/resolveOpen create-branch's own equivalent tmpfs check. */
     if (!vfsPermitted(sfsModeOf(parentInode), sfsUidOf(parentInode), sfsGidOf(parentInode),
                        currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
         return -1;
@@ -830,13 +776,6 @@ static bool readSymlinkTarget(int32 inodeNum, char* buf, uint64 cap)
     return true;
 }
 
-/* Walks path one component at a time from the root, exactly like the old
-   flat sfsLookup used to, except a symlink component (other than possibly
-   the last one, depending on followFinal) is resolved by re-running this
-   same walk on its target and splicing the result back in as `cur` before
-   continuing with whatever of the original path remains. depth counts hops
-   already taken across that splicing, so a cycle (or merely a very long
-   chain) fails cleanly with -1 instead of recursing without bound. */
 static int32 lookupFrom(const char* path, bool followFinal, int depth)
 {
     if (!isMounted)
@@ -858,11 +797,6 @@ static int32 lookupFrom(const char* path, bool followFinal, int depth)
             return -1;
         if (sfsTypeOf(cur) != sfsTypeDir)
             return -1;
-        /* Real POSIX search permission on every directory ANCESTOR walked
-           through, mirroring vfs.c's lookupNode's own equivalent check for
-           tmpfs -- resolving a name inside `cur` needs the owner-or-other
-           exec bit for the calling thread's uid, not just "cur is a
-           directory". */
         if (!vfsPermitted(sfsModeOf(cur), sfsUidOf(cur), sfsGidOf(cur),
                            currentThreadUid(), currentThreadGid(), fsModeOwnerExec))
             return -1;
@@ -888,8 +822,6 @@ static int32 lookupFrom(const char* path, bool followFinal, int depth)
     }
     return cur;
 }
-
-/* --- public API --- */
 
 bool sfsFormat(void)
 {
@@ -926,11 +858,6 @@ bool sfsFormat(void)
     if (nsb.dataStart >= nsb.totalBlocks)
         return false;
 
-    /* Committed to actually wiping from here on (every earlier return above
-       is a rejected format that touched nothing) -- every inode number's
-       old meaning is about to become garbage, so anything that cached one
-       from before this point must be told apart from anything cached
-       after. */
     formatGeneration++;
 
     if (inodeBitmap) {
@@ -1150,9 +1077,6 @@ int32 sfsLink(const char* existingPath, const char* newPath)
     int32 parentInode = sfsLookup(parentBuf);
     if (parentInode < 0 || sfsTypeOf(parentInode) != sfsTypeDir)
         return -1;
-    /* Same parent-directory write check as createNode/sfsRemove above --
-       adding a new hardlink NAME needs write permission on the PARENT of
-       the new name, not on the existing target being linked to. */
     if (!vfsPermitted(sfsModeOf(parentInode), sfsUidOf(parentInode), sfsGidOf(parentInode),
                        currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
         return -1;
@@ -1195,9 +1119,6 @@ bool sfsRemove(const char* path)
     int32 parentInode = sfsLookup(parentBuf);
     if (parentInode < 0)
         return false;
-    /* Same parent-directory write check as createNode above -- removing an
-       entry needs write permission on the PARENT, not the entry itself,
-       mirroring vfs.c's vfsUnlink/vfsRmdir's own equivalent tmpfs check. */
     if (!vfsPermitted(sfsModeOf(parentInode), sfsUidOf(parentInode), sfsGidOf(parentInode),
                        currentThreadUid(), currentThreadGid(), fsModeOwnerWrite))
         return false;

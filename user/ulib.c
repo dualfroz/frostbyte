@@ -11,11 +11,6 @@ static long syscall3(long number, long a1, long a2, long a3)
     return ret;
 }
 
-/* Same trap as syscall3, with a 4th argument -- passed in r10, not rcx,
-   the same choice the real Linux x86-64 syscall ABI makes (rcx is already
-   spoken for by the `int $0x80`/syscall instruction's own use, so a fourth
-   argument needs a register the trap does not otherwise touch). Only
-   userSigAction needs one today. */
 static long syscall4(long number, long a1, long a2, long a3, long a4)
 {
     long ret;
@@ -28,10 +23,6 @@ static long syscall4(long number, long a1, long a2, long a3, long a4)
     return ret;
 }
 
-/* Same trap again, with a 5th and 6th argument in r8/r9 -- the same real
-   Linux x86-64 syscall ABI register order this file's own 4th-argument
-   choice (r10) already follows, continued one register further. Only
-   userMmap needs this many today. */
 static long syscall6(long number, long a1, long a2, long a3, long a4, long a5, long a6)
 {
     long ret;
@@ -342,6 +333,16 @@ unsigned long stringLength(const char* text)
 void print(const char* text)
 {
     userWrite(1, text, stringLength(text));
+}
+
+void printParts(const char* const* parts)
+{
+    char line[256];
+    unsigned long length = 0;
+    for (int i = 0; parts[i]; i++)
+        for (const char* c = parts[i]; *c && length < sizeof(line); c++)
+            line[length++] = *c;
+    userWrite(1, line, length);
 }
 
 void printDec(long value)

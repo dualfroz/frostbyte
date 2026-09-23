@@ -22,7 +22,7 @@ void prioqInsert(PrioQueue* q, PrioQNode* n, uint64 vruntime, uint32 id)
     n->vruntime = vruntime;
     n->id = id;
     bool inserted = rbtInsert(&q->tree, &n->node, compareNodes);
-    (void)inserted; /* unique id guarantees the key can never already exist */
+    (void)inserted;
 }
 
 PrioQNode* prioqPeekMin(const PrioQueue* q)

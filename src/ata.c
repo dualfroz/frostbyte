@@ -31,9 +31,6 @@ static char modelBuffer[41];
 
 static void ataIoDelay(void)
 {
-    /* Selecting a drive needs ~400ns to settle; reading the alternate
-       status register is a documented no-op read that burns exactly that
-       long without disturbing the main status register. */
     inb(ataRegControl);
     inb(ataRegControl);
     inb(ataRegControl);
@@ -80,9 +77,9 @@ bool ataInit(void)
     totalSectors = 0;
     modelBuffer[0] = 0;
 
-    outb(ataRegControl, 0x02); /* nIEN: this driver only ever polls */
+    outb(ataRegControl, 0x02);
 
-    outb(ataRegDriveHead, 0xA0); /* master, no chs/lba bits needed yet */
+    outb(ataRegDriveHead, 0xA0);
     ataIoDelay();
     outb(ataRegSectorCnt, 0);
     outb(ataRegLbaLow, 0);
@@ -91,14 +88,11 @@ bool ataInit(void)
     outb(ataRegCommand, ataCmdIdentify);
 
     if (inb(ataRegStatus) == 0)
-        return false; /* floating bus: no drive wired up on this channel */
+        return false;
 
     if (!ataWaitClear(ataStatusBsy))
         return false;
 
-    /* A plain PATA hard disk leaves LBA mid/high at 0 after IDENTIFY; an
-       ATAPI or SATA-bridge device stamps a signature there instead. This
-       driver only supports the former. */
     if (inb(ataRegLbaMid) != 0 || inb(ataRegLbaHigh) != 0)
         return false;
 

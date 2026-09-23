@@ -7,12 +7,6 @@
 #define elfTypeExec 2
 #define elfMachineX8664 62
 
-/* Standard ELF64 Elf64ProgramHeader.flags bits (p_flags) -- PF_X/PF_W/PF_R
-   by their real numeric values, not this kernel's own invention. PF_R is
-   never consulted below: every mapping pagingMapUserRangeExact creates is
-   already readable by virtue of pageUser alone (x86_64 has no separate
-   read-disable outside SMAP/PKU, neither of which this kernel uses), so a
-   segment missing PF_R would be indistinguishable from one that has it. */
 #define elfFlagExecute 1
 #define elfFlagWrite   2
 
@@ -30,16 +24,6 @@ static bool validHeader(const Elf64Header* header)
     return true;
 }
 
-/* Translates one ELF64 program header's own p_flags into the extra
-   paging.h leaf-PTE bits pagingMapUserRangeExact needs to map that exact
-   segment with real per-segment W^X: writable iff PF_W was set, and
-   pageNoExecute UNLESS PF_X was set (never both writable and executable
-   at once for a segment that asked for neither, or for one that asked
-   for only PF_W -- data/bss segments -- which is the whole point).
-   Pulled out as its own pure function, no paging/scheduler/VFS involved,
-   so elfTest.c can exercise every PF_X/PF_W combination deterministically
-   before the scheduler even starts, the same way this file's other pure
-   address-arithmetic helpers (elfSlotBase and friends) already are. */
 uint64 elfSegmentPagingFlags(uint32 segmentFlags)
 {
     uint64 flags = 0;
@@ -48,6 +32,14 @@ uint64 elfSegmentPagingFlags(uint32 segmentFlags)
     if (!(segmentFlags & elfFlagExecute))
         flags |= pageNoExecute;
     return flags;
+}
+
+uint64 elfImageEntry(const void* image, uint64 imageSize)
+{
+    const Elf64Header* header = (const Elf64Header*)image;
+    if (imageSize < sizeof(Elf64Header) || !validHeader(header))
+        return 0;
+    return header->entry;
 }
 
 uint64 elfLoad(const void* image, uint64 imageSize)
@@ -105,9 +97,6 @@ bool elfBuildInitialStack(uint64 stackTop, uint64 stackSize, const char* const* 
     uint64 argvAddr[elfMaxArgs];
     uint64 cursor = stackTop;
 
-    /* Strings first, growing downward from the top of the stack -- each
-       one's address is remembered so the pointer array below can point at
-       it once every string is placed. */
     for (int i = argc - 1; i >= 0; i--) {
         uint64 len = strlen(argv[i]) + 1;
         if (cursor - stackBottom < len)
@@ -117,10 +106,6 @@ bool elfBuildInitialStack(uint64 stackTop, uint64 stackSize, const char* const* 
         argvAddr[i] = cursor;
     }
 
-    /* argc slot + argv[0..argc-1] + a NULL terminator, SysV-style. Rounded
-       down to 16 bytes because that is where _start (crt.S) expects rsp to
-       sit at process entry (so that its own later `call main` leaves main
-       looking at the usual post-call rsp%16==8). */
     uint64 fixedAreaBytes = (uint64)(argc + 2) * sizeof(uint64);
     if (cursor - stackBottom < fixedAreaBytes)
         return false;

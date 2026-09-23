@@ -58,16 +58,8 @@
 #define sysMmap        54
 #define sysMunmap      55
 
-/* Sentinel pid for sysWait (syscall.c)/userWaitAny (ulib.c): real
-   waitpid(-1)-style "reap whichever child happens to already be dead,
-   without caring which specific pid" instead of the ordinary "wait for
-   exactly this one" contract every other sysWait id value has.
-   (unsigned int)-1 can never collide with a real pid, since pid 0 (idle)
-   and every id returned by threadCreate/threadCreateUser are always <
-   maxThreads (sched.c). Deliberately spelled with the plain C type, not
-   sched.h's uint32, so this header stays usable from userland (ulib.h/
-   ulib.c) exactly like fs.h/signalnum.h's own shared definitions already
-   are -- see fs.h's FbStat for the same convention. */
 #define waitAnyPid ((unsigned int)-1)
+
+#define spawnSlotBusy (-2)
 
 #endif

@@ -1,17 +1,5 @@
 #include "ulib.h"
 
-/*
- * Live proof that shell.c's new wildcard glob expansion (shellExpandGlobs)
- * really hands a spawned process REAL, distinct filenames resolved from a
- * pattern typed at the shell (`globcat /tmp/gd/ *.txt`) -- not a literal,
- * unexpanded "*.txt" string, and not every file in the directory (the
- * sibling /tmp/gd/c.log the driver thread also creates must NOT appear).
- * Prints how many files it actually received, then each one's own path and
- * content, all on fd 1 (unlike pipecat.c/hcat.c, this program's own argv
- * and stdout ARE the thing being demonstrated, not a pipe payload it must
- * keep pristine).
- */
-
 static void printErr(const char* text)
 {
     userWrite(2, text, stringLength(text));
@@ -19,9 +7,9 @@ static void printErr(const char* text)
 
 int main(int argc, char** argv)
 {
-    print("globcat: got ");
-    printDec(argc - 1);
-    print(" files\n");
+    char countText[24];
+    decToString(argc - 1, countText);
+    printParts((const char* const[]){ "globcat: got ", countText, " files\n", 0 });
 
     for (int i = 1; i < argc; i++) {
         long fd = userOpen(argv[i], oReadOnly);
@@ -41,10 +29,7 @@ int main(int argc, char** argv)
         }
         buffer[got] = 0;
 
-        print("globcat: ");
-        print(argv[i]);
-        print("=");
-        print(buffer);
+        printParts((const char* const[]){ "globcat: ", argv[i], "=", buffer, 0 });
     }
 
     return 0;

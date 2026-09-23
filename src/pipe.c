@@ -9,34 +9,13 @@ typedef struct Pipe {
     uint32 readers;
     uint32 writers;
     bool used;
-    /* Set once, permanently (mirrors Thread.everRan, sched.h), the first
-       time a reader/writer is ever attached. A pipeCreateDetached handle
-       starts with both counts AND both of these false, so pipeRead/
-       pipeWrite can tell "the other end just has not attached yet" (keep
-       retrying) apart from "it attached and then went away" (true EOF /
-       broken pipe) -- pipeCreate sets both true immediately, since its
-       caller always installs both ends atomically, so its behavior is
-       completely unchanged. */
     bool everHadReader;
     bool everHadWriter;
-    /* Distinguishes THIS specific pipe living at a given slot from any other
-       pipe that has occupied (or will ever occupy) the same numeric handle
-       before or after -- pipeReleaseIfUnused frees a slot's `used` flag the
-       moment both ends are gone, so allocPipeSlot happily reuses that same
-       number for a completely unrelated pipeCreate/pipeCreateDetached right
-       after. A caller that caches a handle across time spanning such a
-       release (vfs.c's SFS-backed named-fifo bindings, see sfsFifoHandleFor
-       in vfs.c) needs more than pipeValid(handle) to tell "the same pipe I
-       bound to earlier" apart from "a different pipe that happens to have
-       been assigned the same number since" -- see pipeIncarnation. */
     uint32 incarnation;
 } Pipe;
 
 static Pipe pipes[maxPipes];
 
-/* Never 0 (see pipeIncarnation's "0 always means invalid" contract) -- next
-   value handed to whichever pipe allocPipeSlot's caller creates next,
-   regardless of which slot index it lands in. */
 static uint32 nextPipeIncarnation = 1;
 
 static Pipe* pipeAt(int handle)
@@ -56,7 +35,7 @@ static int allocPipeSlot(void)
     return -1;
 }
 
-int pipeCreate(void)
+static int createPipe(void)
 {
     int i = allocPipeSlot();
     if (i < 0)
@@ -73,7 +52,7 @@ int pipeCreate(void)
     return i;
 }
 
-int pipeCreateDetached(void)
+static int createDetachedPipe(void)
 {
     int i = allocPipeSlot();
     if (i < 0)
@@ -90,16 +69,23 @@ int pipeCreateDetached(void)
     return i;
 }
 
-void pipeAddReader(int handle)
+static void addReader(int handle)
 {
     Pipe* p = pipeAt(handle);
     if (!p)
         return;
     p->readers++;
     p->everHadReader = true;
+    schedWakeChannel((const void*)p);
 }
 
-void pipeAddWriter(int handle)
+bool pipeHasReader(int handle)
+{
+    Pipe* p = pipeAt(handle);
+    return p && p->readers > 0;
+}
+
+static void addWriter(int handle)
 {
     Pipe* p = pipeAt(handle);
     if (!p)
@@ -134,7 +120,7 @@ uint32 pipeIncarnation(int handle)
     return p->incarnation;
 }
 
-int64 pipeRead(int handle, void* buffer, uint64 length)
+static int64 readPipe(int handle, void* buffer, uint64 length)
 {
     Pipe* p = pipeAt(handle);
     if (!p)
@@ -144,31 +130,22 @@ int64 pipeRead(int handle, void* buffer, uint64 length)
 
     if (!ringIsEmpty(&p->ring)) {
         usize got = ringRead(&p->ring, (uint8*)buffer, (usize)length);
-        /* Reading frees ring space: any writer blocked on "buffer full" may
-           now be able to proceed, so give it a chance to recheck. */
         schedWakeChannel((const void*)p);
         schedWakeChannel(schedPollChannel());
         return (int64)got;
     }
 
-    /* Only a writer that WAS attached and has since gone away means true
-       EOF -- a pipeCreateDetached handle nobody has written to yet (readers
-       0, everHadWriter false) has to keep reporting "try again" instead,
-       or a reader that races ahead of the writer's own vfsPipeAttach would
-       see spurious end-of-file on an otherwise perfectly live pipe. */
     if (p->writers == 0 && p->everHadWriter)
         return 0;
 
     return -1;
 }
 
-int64 pipeWrite(int handle, const void* buffer, uint64 length)
+static int64 writePipe(int handle, const void* buffer, uint64 length)
 {
     Pipe* p = pipeAt(handle);
     if (!p)
         return -1;
-    /* Symmetric with pipeRead's EOF check above: only a reader that WAS
-       attached and left counts as a broken pipe. */
     if (p->readers == 0 && p->everHadReader)
         return -1;
     if (length == 0)
@@ -178,8 +155,6 @@ int64 pipeWrite(int handle, const void* buffer, uint64 length)
         return -1;
 
     usize put = ringWrite(&p->ring, (const uint8*)buffer, (usize)length);
-    /* Writing adds ring data: any reader blocked on "buffer empty" may now
-       be able to proceed, so give it a chance to recheck. */
     schedWakeChannel((const void*)p);
     schedWakeChannel(schedPollChannel());
     return (int64)put;
@@ -208,11 +183,12 @@ int64 pipeReadBlocking(int handle, void* buffer, uint64 length)
         return -1;
 
     for (;;) {
-        int64 result = pipeRead(handle, buffer, length);
-        if (result != -1)
-            return result;
-
         schedBlockCurrent((const void*)p);
+        int64 result = pipeRead(handle, buffer, length);
+        if (result != -1) {
+            schedCancelBlockCurrent();
+            return result;
+        }
         halt();
     }
 }
@@ -224,18 +200,12 @@ int64 pipeWriteBlocking(int handle, const void* buffer, uint64 length)
         return -1;
 
     for (;;) {
-        int64 result = pipeWrite(handle, buffer, length);
-        if (result != -1)
-            return result;
-
-        /* A reader that attached and then left is a broken pipe: a terminal
-           condition no amount of waiting will ever resolve, unlike a merely
-           full buffer (or a pipeCreateDetached handle whose reader simply
-           has not attached yet). */
-        if (pipeWriteBroken(handle))
-            return -1;
-
         schedBlockCurrent((const void*)p);
+        int64 result = pipeWrite(handle, buffer, length);
+        if (result != -1 || pipeWriteBroken(handle)) {
+            schedCancelBlockCurrent();
+            return result;
+        }
         halt();
     }
 }
@@ -247,16 +217,13 @@ static void pipeReleaseIfUnused(int handle)
         p->used = false;
 }
 
-void pipeCloseRead(int handle)
+static void closeRead(int handle)
 {
     Pipe* p = pipeAt(handle);
     if (!p)
         return;
     if (p->readers > 0)
         p->readers--;
-    /* A writer parked on "buffer full" must be woken to discover the pipe is
-       now broken instead of waiting forever for space that will never free
-       up on its own. */
     if (p->readers == 0) {
         schedWakeChannel((const void*)p);
         schedWakeChannel(schedPollChannel());
@@ -264,16 +231,13 @@ void pipeCloseRead(int handle)
     pipeReleaseIfUnused(handle);
 }
 
-void pipeCloseWrite(int handle)
+static void closeWrite(int handle)
 {
     Pipe* p = pipeAt(handle);
     if (!p)
         return;
     if (p->writers > 0)
         p->writers--;
-    /* A reader parked on "buffer empty" must be woken to discover true
-       end-of-file instead of waiting forever for data that will never
-       arrive. */
     if (p->writers == 0) {
         schedWakeChannel((const void*)p);
         schedWakeChannel(schedPollChannel());
@@ -281,11 +245,79 @@ void pipeCloseWrite(int handle)
     pipeReleaseIfUnused(handle);
 }
 
-bool pipeDestroyIfUnattached(int handle)
+static bool destroyIfUnattached(int handle)
 {
     Pipe* p = pipeAt(handle);
     if (!p || p->readers != 0 || p->writers != 0)
         return false;
     p->used = false;
     return true;
+}
+
+int pipeCreate(void)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    int handle = createPipe();
+    restoreInterrupts(flags);
+    return handle;
+}
+
+int pipeCreateDetached(void)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    int handle = createDetachedPipe();
+    restoreInterrupts(flags);
+    return handle;
+}
+
+void pipeAddReader(int handle)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    addReader(handle);
+    restoreInterrupts(flags);
+}
+
+void pipeAddWriter(int handle)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    addWriter(handle);
+    restoreInterrupts(flags);
+}
+
+int64 pipeRead(int handle, void* buffer, uint64 length)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    int64 got = readPipe(handle, buffer, length);
+    restoreInterrupts(flags);
+    return got;
+}
+
+int64 pipeWrite(int handle, const void* buffer, uint64 length)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    int64 put = writePipe(handle, buffer, length);
+    restoreInterrupts(flags);
+    return put;
+}
+
+void pipeCloseRead(int handle)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    closeRead(handle);
+    restoreInterrupts(flags);
+}
+
+void pipeCloseWrite(int handle)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    closeWrite(handle);
+    restoreInterrupts(flags);
+}
+
+bool pipeDestroyIfUnattached(int handle)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    bool destroyed = destroyIfUnattached(handle);
+    restoreInterrupts(flags);
+    return destroyed;
 }

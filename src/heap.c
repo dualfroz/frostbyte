@@ -1,5 +1,6 @@
 #include "heap.h"
 #include "string.h"
+#include "ports.h"
 
 typedef struct Block {
     usize size;
@@ -45,7 +46,7 @@ static void split(Block* block, usize wanted)
     block->size = wanted;
 }
 
-void* kmalloc(usize size)
+static void* allocate(usize size)
 {
     if (size == 0)
         size = 16;
@@ -61,11 +62,8 @@ void* kmalloc(usize size)
     return nullptr;
 }
 
-void kfree(void* pointer)
+static void release(void* pointer)
 {
-    if (!pointer)
-        return;
-
     Block* block = (Block*)((uint8*)pointer - sizeof(Block));
     block->free = 1;
 
@@ -84,6 +82,23 @@ void kfree(void* pointer)
         if (block->next)
             block->next->prev = keep;
     }
+}
+
+void* kmalloc(usize size)
+{
+    uint64 flags = saveAndDisableInterrupts();
+    void* memory = allocate(size);
+    restoreInterrupts(flags);
+    return memory;
+}
+
+void kfree(void* pointer)
+{
+    if (!pointer)
+        return;
+    uint64 flags = saveAndDisableInterrupts();
+    release(pointer);
+    restoreInterrupts(flags);
 }
 
 void* krealloc(void* pointer, usize size)

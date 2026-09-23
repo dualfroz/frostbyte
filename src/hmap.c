@@ -5,10 +5,10 @@
 
 uint64 hmapHashString(const char* key)
 {
-    uint64 hash = 1469598103934665603UL; /* FNV-1a 64-bit offset basis */
+    uint64 hash = 1469598103934665603UL;
     for (const unsigned char* p = (const unsigned char*)key; *p; p++) {
         hash ^= (uint64)*p;
-        hash *= 1099511628211UL; /* FNV-1a 64-bit prime */
+        hash *= 1099511628211UL;
     }
     return hash;
 }

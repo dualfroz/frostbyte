@@ -33,7 +33,7 @@ static Slab* growSlab(KmemCache* cache)
         obj->next = prev;
         prev = obj;
     }
-    slab->freeList = prev;   /* built back-to-front; order does not matter */
+    slab->freeList = prev;
 
     cache->slabs = slab;
     cache->slabCount++;

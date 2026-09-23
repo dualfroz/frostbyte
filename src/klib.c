@@ -1,8 +1,6 @@
 #include "klib.h"
 #include "string.h"
 
-/* ---- character classification -------------------------------------- */
-
 bool isDigit(int c) { return c >= '0' && c <= '9'; }
 bool isUpper(int c) { return c >= 'A' && c <= 'Z'; }
 bool isLower(int c) { return c >= 'a' && c <= 'z'; }
@@ -13,8 +11,6 @@ bool isHexDigit(int c) { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A
 
 int toUpper(int c) { return isLower(c) ? c - 'a' + 'A' : c; }
 int toLower(int c) { return isUpper(c) ? c - 'A' + 'a' : c; }
-
-/* ---- string manipulation --------------------------------------------- */
 
 char* strcpy(char* dest, const char* src)
 {
@@ -125,8 +121,6 @@ char* strTokR(char* str, const char* delim, char** savePtr)
     return cursor;
 }
 
-/* ---- number parsing ---------------------------------------------------- */
-
 static int digitValue(int c)
 {
     if (c >= '0' && c <= '9')
@@ -175,22 +169,16 @@ uint64 strtoul(const char* str, char** endPtr, int base)
 
 int64 strtol(const char* str, char** endPtr, int base)
 {
-    /* strtoul already skips whitespace, consumes an optional sign and
-       applies it (via unsigned two's-complement negation) before we ever
-       see the result, so reinterpreting its bits as signed is correct
-       on its own -- negating again here would flip the sign twice. */
     return (int64)strtoul(str, endPtr, base);
 }
 
 int32 atoi(const char* str) { return (int32)strtol(str, nullptr, 10); }
 int64 atol(const char* str) { return strtol(str, nullptr, 10); }
 
-/* ---- formatted output --------------------------------------------------- */
-
 typedef struct SnprintfSink {
     char* buf;
-    usize size;   /* capacity including the room for a nul terminator */
-    usize written; /* total chars that would be written, unbounded */
+    usize size;
+    usize written;
 } SnprintfSink;
 
 static void sinkPutChar(SnprintfSink* sink, char c)
@@ -314,8 +302,6 @@ int snprintf(char* buf, usize size, const char* format, ...)
     return result;
 }
 
-/* ---- generic sorting / searching ---------------------------------------- */
-
 static void rawSwap(uint8* a, uint8* b, usize size)
 {
     for (usize i = 0; i < size; i++) {
@@ -325,9 +311,6 @@ static void rawSwap(uint8* a, uint8* b, usize size)
     }
 }
 
-/* Insertion sort: O(n^2) but allocation-free and simple to prove correct;
-   fine for the small, bounded arrays a freestanding kernel actually sorts
-   (dirents in a directory, a handful of scheduler entries, ...). */
 void qsort(void* base, usize count, usize size, int (*cmp)(const void*, const void*))
 {
     uint8* items = (uint8*)base;

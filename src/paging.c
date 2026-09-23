@@ -1,18 +1,12 @@
 #include "paging.h"
 #include "pmm.h"
 #include "string.h"
+#include "ports.h"
 
 #define entryPresent 0x1
 #define entryPageSize 0x80
 #define addressMask 0x000FFFFFFFFFF000ull
 
-/* Set by boot.S once, before kmain ever runs: 1 if CPUID.80000001H:EDX.NX
-   was reported AND IA32_EFER.NXE was actually written, 0 otherwise (either
-   the CPU never claimed the feature, or -- unreachable on any CPU that
-   passed this kernel's own checkLongMode, but checked independently and
-   honestly anyway -- some hypervisor quirk refused it). A plain uint32,
-   not this codebase's own enum bool, so boot.S's 32-bit `movl` store has
-   an unambiguous, non-implementation-defined width to write into. */
 extern uint32 cpuNxSupported;
 
 bool pagingNxSupported(void)
@@ -56,7 +50,7 @@ static uint64* nextTable(uint64* table, uint64 index, uint64 parentFlags, bool c
     return (uint64*)frame;
 }
 
-bool pagingMap(uint64 virtualAddr, uint64 physicalAddr, uint64 flags)
+static bool mapPage(uint64 virtualAddr, uint64 physicalAddr, uint64 flags)
 {
     uint64 pml4Index = (virtualAddr >> 39) & 0x1FF;
     uint64 pdptIndex = (virtualAddr >> 30) & 0x1FF;
@@ -79,13 +73,6 @@ bool pagingMap(uint64 virtualAddr, uint64 physicalAddr, uint64 flags)
     if (!pt)
         return false;
 
-    /* flags & 0xFFF keeps the low-12-bits PTE flags (pagePresent/pageWrite/
-       pageUser, plus whatever hardware-ignored bits a caller might pass);
-       pageNoExecute (bit 63) is a completely separate mask so it survives
-       that truncation -- silently dropped rather than written when
-       pagingNxSupported() is false, since bit 63 of a PTE is architecturally
-       reserved (must be 0) whenever IA32_EFER.NXE is clear, and setting a
-       reserved bit faults. */
     uint64 leafFlags = (flags & 0xFFF) | pagePresent;
     if ((flags & pageNoExecute) && pagingNxSupported())
         leafFlags |= pageNoExecute;
@@ -93,6 +80,14 @@ bool pagingMap(uint64 virtualAddr, uint64 physicalAddr, uint64 flags)
     pt[ptIndex] = (physicalAddr & addressMask) | leafFlags;
     invalidatePage(virtualAddr);
     return true;
+}
+
+bool pagingMap(uint64 virtualAddr, uint64 physicalAddr, uint64 flags)
+{
+    uint64 saved = saveAndDisableInterrupts();
+    bool mapped = mapPage(virtualAddr, physicalAddr, flags);
+    restoreInterrupts(saved);
+    return mapped;
 }
 
 bool pagingIsExecutable(uint64 virtualAddr)
@@ -170,20 +165,30 @@ uint64 pagingResolve(uint64 virtualAddr)
     return (pt[ptIndex] & addressMask) + (virtualAddr & 0xFFF);
 }
 
+static bool mapFreshUserPage(uint64 page, uint64 flags)
+{
+    if (pagingResolve(page) != 0)
+        return true;
+    uint64 frame = pmmAlloc();
+    if (frame == 0)
+        return false;
+    if (!mapPage(page, frame, pageUser | flags))
+        return false;
+    memset((void*)page, 0, frameSize);
+    return true;
+}
+
 bool pagingMapUserRangeExact(uint64 virtualAddr, uint64 size, uint64 flags)
 {
     uint64 first = virtualAddr & ~(uint64)(frameSize - 1);
     uint64 last = (virtualAddr + size + frameSize - 1) & ~(uint64)(frameSize - 1);
 
     for (uint64 page = first; page < last; page += frameSize) {
-        if (pagingResolve(page) != 0)
-            continue;
-        uint64 frame = pmmAlloc();
-        if (frame == 0)
+        uint64 saved = saveAndDisableInterrupts();
+        bool mapped = mapFreshUserPage(page, flags);
+        restoreInterrupts(saved);
+        if (!mapped)
             return false;
-        if (!pagingMap(page, frame, pageUser | flags))
-            return false;
-        memset((void*)page, 0, frameSize);
     }
     return true;
 }
@@ -198,13 +203,6 @@ bool pagingMapUserRange(uint64 virtualAddr, uint64 size)
     return pagingMapUserRangeFlags(virtualAddr, size, 0);
 }
 
-/* True if every one of a table's 512 entries is not-present -- used to
-   decide whether a page-table page that unmapping just emptied out can be
-   given back to the pmm itself, not just the leaf data frame it pointed
-   to. Must scan the whole table, not just the entry this call touched: a
-   PD table in particular can be shared by several unrelated elfSlotSize
-   slots at once (a PDPT entry spans 1GB, four times a 256 MiB slot), so
-   only a table that is genuinely empty end-to-end is safe to free. */
 static bool tableEmpty(const uint64* table)
 {
     for (uint64 i = 0; i < 512; i++)
@@ -240,17 +238,6 @@ static void unmapOnePage(uint64 virtualAddr)
     pt[ptIndex] = 0;
     invalidatePage(virtualAddr);
 
-    /* Bottom-up structural cleanup: a PT/PD page-table page is itself just
-       a pmm frame (see nextTable's create path), and every page
-       pagingMapUserRange ever maps allocates one on demand -- leaving them
-       behind once the last leaf entry they held is gone would be a second,
-       smaller leak underneath the one this function exists to fix.
-       Deliberately stops at PD: reclaiming a PDPT or the PML4 itself would
-       mean tearing down a structure shared by up to 512GB / 1GB of
-       unrelated address space respectively, which nothing in this kernel's
-       single shared page table can ever actually make fully empty (the
-       kernel's own mappings always live somewhere under the same PML4
-       entry as every user slot). */
     if (tableEmpty(pt)) {
         pmmFree((uint64)pt);
         pd[pdIndex] = 0;
@@ -267,6 +254,9 @@ void pagingUnmapUserRange(uint64 virtualAddr, uint64 size)
     uint64 first = virtualAddr & ~(uint64)(frameSize - 1);
     uint64 last = (virtualAddr + size + frameSize - 1) & ~(uint64)(frameSize - 1);
 
-    for (uint64 page = first; page < last; page += frameSize)
+    for (uint64 page = first; page < last; page += frameSize) {
+        uint64 saved = saveAndDisableInterrupts();
         unmapOnePage(page);
+        restoreInterrupts(saved);
+    }
 }
