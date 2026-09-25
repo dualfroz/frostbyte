@@ -1,8 +1,4 @@
 #!/bin/sh
-# Headless boot gate: run the ISO in QEMU, capture COM1, and require that a
-# ring-3 program read a known ramdisk (USTAR) file, round-tripped a tmpfs
-# file, and round-tripped real sector I/O against a QEMU-emulated ATA disk
-# via /dev/disk0. Exits non-zero when any expected string is missing.
 
 here=$(dirname "$0")
 root=$(cd "$here/.." && pwd)
@@ -19,17 +15,10 @@ if [ ! -f "$disk" ]; then
     dd if=/dev/zero of="$disk" bs=1M count=8 status=none
 fi
 
-log=$(mktemp)
-timeout 25 qemu-system-x86_64 -cdrom "$iso" \
-    -drive file="$disk",format=raw,if=ide -serial "file:$log" \
-    -display none -m 128M -no-reboot >/dev/null 2>&1 || true
+maxSeconds=${CI_TEST_MAX_SECONDS:-120}
 
-echo "----- serial log (tail) -----"
-tail -n 30 "$log" 2>/dev/null
-echo "-----------------------------"
-
-status=0
-for needle in \
+printNeedles() {
+    printf '%s\n' \
     "frostbyte-ustar-read-ok" \
     "frostbyte-tmpfs-rw-ok" \
     "fileread: done" \
@@ -42,12 +31,14 @@ for needle in \
     "join-reap-ok" \
     "proctest: spawn+wait ok" \
     "proctest: spawn bad path rejected" \
+    "proctest: spawn of live binary rejected" \
     "proctest: wait bad pid rejected" \
     "exectarget: running" \
     "exec-pid-preserved-ok" \
     "user-mem-reclaimed-ok" \
     "exec-old-slot-freed-ok" \
     "proctest: spawn with argv ok" \
+    "proctest: exec of live binary rejected" \
     "argtest: argv-ok" \
     "fiforeader: attached, blocking on read" \
     "fifowriter: wrote payload" \
@@ -327,19 +318,78 @@ for needle in \
     "f 17 data.txt 20" \
     "typing shell commands for the &&/|| chaining demo" \
     "ao2"
-do
+}
+
+missingNeedles() {
+    awk 'NR == FNR { want[NR] = $0; next }
+         { for (i in want) if (index($0, want[i])) delete want[i] }
+         END { left = 0; for (i in want) left++; print left }' "$needleFile" "$log"
+}
+
+log=$(mktemp)
+needleFile=$(mktemp)
+qemuPid=
+cleanup() {
+    if [ -n "$qemuPid" ]; then
+        kill "$qemuPid" 2>/dev/null
+        wait "$qemuPid" 2>/dev/null
+    fi
+    rm -f "$log" "$needleFile"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+printNeedles > "$needleFile"
+
+qemu-system-x86_64 -cdrom "$iso" \
+    -drive file="$disk",format=raw,if=ide -serial "file:$log" \
+    -display none -m 128M -no-reboot >/dev/null 2>&1 &
+qemuPid=$!
+
+elapsed=0
+outcome="time limit of ${maxSeconds}s reached"
+while [ "$elapsed" -lt "$maxSeconds" ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if grep -qE 'FAIL|\[PANIC\]' "$log"; then
+        outcome="failure reported by the kernel"
+        break
+    fi
+    if grep -qF "KTEST SUMMARY:" "$log" && [ "$(missingNeedles)" -eq 0 ]; then
+        outcome="all markers seen"
+        break
+    fi
+    if ! kill -0 "$qemuPid" 2>/dev/null; then
+        outcome="QEMU exited"
+        break
+    fi
+done
+
+kill "$qemuPid" 2>/dev/null
+wait "$qemuPid" 2>/dev/null
+qemuPid=
+
+echo "----- serial log (tail) -----"
+tail -n 30 "$log" 2>/dev/null
+echo "-----------------------------"
+echo "ci-test: stopped after ${elapsed}s: $outcome"
+
+status=0
+while IFS= read -r needle; do
     if grep -qF "$needle" "$log"; then
         echo "PASS: found '$needle'"
     else
         echo "FAIL: missing '$needle'"
         status=1
     fi
-done
+done < "$needleFile"
 
-# In-kernel self-test battery (ktest). The summary line is machine-readable:
-#   "KTEST SUMMARY: <tests> tests, <checks> checks, <failures> failed"
-# The gate requires that line to exist, report 0 failures, and run at least
-# one test. A hung or crashing test suppresses the line and fails the gate.
+if grep -qE 'FAIL|\[PANIC\]' "$log"; then
+    echo "FAIL: the kernel reported a failure:"
+    grep -E 'FAIL|\[PANIC\]' "$log" | head -n 10
+    status=1
+fi
+
 summary=$(grep -F "KTEST SUMMARY:" "$log" | tail -n 1)
 if [ -z "$summary" ]; then
     echo "FAIL: no 'KTEST SUMMARY:' line (in-kernel tests did not complete)"

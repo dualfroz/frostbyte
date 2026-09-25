@@ -1,35 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for real SA_SIGINFO delivery (signalnum.h's
- * sigFlagSigInfo/SigInfo, signal.c's sigConsumePending) -- proves the
- * extra (SigInfo*, void*) arguments a sigFlagSigInfo handler receives
- * carry genuinely accurate data, not just a valid-looking pointer, in BOTH
- * directions this kernel ever populates SigInfo from:
- *
- *   1. si_pid on a user-sent signal (sysSigSend, syscall.c): spawns
- *      siginfotarget.c and sends it a real sigUsr1 through userSigSend;
- *      siginfotarget's own handler verifies the si_pid it received is
- *      genuinely THIS process's pid (passed as an argv string so there is
- *      no ambiguity about what "correct" means), not just some nonzero
- *      value that happened to be lying around.
- *
- *   2. si_code/si_pid/si_status on a real, kernel-raised SIGCHLD
- *      (threadExit, sched.c): installs its OWN sigFlagSigInfo handler for
- *      sigChld before ever spawning siginfotarget (the same race sigchldtest.c
- *      already had to close with a pre-spawn install), then -- once
- *      siginfotarget's own round trip above completes and it exits with a
- *      distinctive code (77) -- verifies the real SIGCHLD its own handler
- *      received reports siCodeChldExited, the CHILD's real pid, and the
- *      CHILD's real exit status, exactly matching what userWait's
- *      synchronous reap independently confirms right after.
- *
- * Reuses siginfotarget.c's own ready-pipe rendezvous (sigtest.c's pattern)
- * for the same reason sigtest.c needed it: sigUsr1's default disposition
- * is Terminate, so sending it before siginfotarget has actually installed
- * its handler would kill it instead of proving anything.
- */
-
 static volatile int chldFired = 0;
 static volatile int chldCode = -1;
 static volatile int chldPid = -1;
@@ -58,10 +28,6 @@ int main(void)
     printDec(userGetpid());
     print("\n");
 
-    /* Installed BEFORE siginfotarget even exists, exactly like
-       sigchldtest.c's own onChld -- a real SIGCHLD can arrive the instant
-       siginfotarget dies, which this process has no other way to order
-       itself ahead of. */
     if (userSigActionInfo(sigChld, onChld, 0, sigFlagSigInfo) == (long)sigSetFailed) {
         print("siginfotest: FAIL install siginfo sigchld handler\n");
         return 1;
@@ -73,8 +39,6 @@ int main(void)
         return 1;
     }
 
-    /* Attach as reader before siginfotarget exists -- same detached-slot
-       race sigtest.c's own comment documents avoiding. */
     long readyFd = userPipeAttach(readyHandle, 0);
     if (readyFd < 0) {
         print("siginfotest: FAIL attach ready pipe\n");
@@ -106,10 +70,6 @@ int main(void)
     }
     print("siginfotest: sent sigUsr1 to siginfotarget\n");
 
-    /* Bounded poll for the real, kernel-raised SIGCHLD, same idiom
-       sigchldtest.c already uses for the same reason (no timing guess,
-       just enough sleep-wake cycles for the return-to-ring3 pending-signal
-       scan, isr.c, to notice it whenever it actually lands). */
     for (int i = 0; i < 80 && !chldFired; i++)
         userSleep(20);
 

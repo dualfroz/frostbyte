@@ -44,7 +44,7 @@ KTEST(vecSetAt)
     int replacement = 99;
     KT_TRUE(t, vecSet(&v, 2, &replacement));
     KT_EQ(t, *(int*)vecAt(&v, 2), 99);
-    KT_FALSE(t, vecSet(&v, 10, &replacement));   /* out of range */
+    KT_FALSE(t, vecSet(&v, 10, &replacement));
 
     vecFree(&v);
 }
@@ -54,17 +54,17 @@ KTEST(vecInsertRemoveShifts)
     Vec v;
     vecInit(&v, sizeof(int));
     for (int i = 0; i < 5; i++)
-        vecPush(&v, &i);   /* 0 1 2 3 4 */
+        vecPush(&v, &i);
 
     int inserted = 100;
-    KT_TRUE(t, vecInsert(&v, 2, &inserted));   /* 0 1 100 2 3 4 */
+    KT_TRUE(t, vecInsert(&v, 2, &inserted));
     KT_EQ(t, vecLen(&v), 6);
     KT_EQ(t, *(int*)vecAt(&v, 2), 100);
     KT_EQ(t, *(int*)vecAt(&v, 3), 2);
     KT_EQ(t, *(int*)vecAt(&v, 5), 4);
 
     int removed = -1;
-    KT_TRUE(t, vecRemove(&v, 2, &removed));    /* back to 0 1 2 3 4 */
+    KT_TRUE(t, vecRemove(&v, 2, &removed));
     KT_EQ(t, removed, 100);
     KT_EQ(t, vecLen(&v), 5);
     for (int i = 0; i < 5; i++)
@@ -84,7 +84,7 @@ KTEST(vecClearKeepsCapacity)
     vecClear(&v);
     KT_EQ(t, vecLen(&v), 0);
     KT_TRUE(t, vecIsEmpty(&v));
-    KT_EQ(t, vecCap(&v), capBefore);   /* clear does not free backing storage */
+    KT_EQ(t, vecCap(&v), capBefore);
 
     int again = 7;
     KT_TRUE(t, vecPush(&v, &again));

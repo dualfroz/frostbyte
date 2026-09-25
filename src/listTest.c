@@ -55,7 +55,6 @@ KTEST(listPushFrontOrder)
         items[i].value = i;
         listPushFront(&head, &items[i].node);
     }
-    /* pushing 0,1,2 to the front in order yields 2,1,0 */
     int expected[3] = { 2, 1, 0 };
     int idx = 0;
     ListNode* cursor;
@@ -89,7 +88,6 @@ KTEST(listRemoveMiddle)
         idx++;
     }
 
-    /* a removed node becomes its own trivial list */
     KT_TRUE(t, listEmpty(&items[1].node));
 }
 

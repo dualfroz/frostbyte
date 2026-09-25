@@ -2,18 +2,6 @@
 #include "pipe.h"
 #include "string.h"
 
-/*
- * pipeReadBlocking/pipeWriteBlocking only return without parking the thread
- * when the very first attempt already resolves (data/space/EOF/broken-pipe
- * already true) - any scenario that would genuinely need to park calls
- * halt(), which requires a live, interrupt-driven scheduler to ever resume
- * from. ktestRunAll() runs before schedStart() (see ktest.h) on the sole
- * execution context there is, so these tests deliberately only cover the
- * "resolves immediately, never blocks" paths. The genuine cross-thread
- * park/wake handshake is exercised for real at boot by the producer/consumer
- * demo in kmain.c (needle "pipe demo: eof, count=10" in tools/ci-test.sh).
- */
-
 KTEST(pipeReadBlockingReturnsQueuedDataImmediately)
 {
     int h = pipeCreate();
@@ -99,9 +87,6 @@ KTEST(pipeWriteBlockingSucceedsRightAfterDrainFreesRoom)
 
     KT_EQ(t, pipeWrite(h, chunk, sizeof(chunk)), (int64)sizeof(chunk));
 
-    /* buffer is completely full: a blocking write would have to park here if
-       nothing ever drained it, so proving this call returns at all (rather
-       than hanging the whole test run) is exactly the point. */
     uint8 drained[16];
     KT_EQ(t, pipeRead(h, drained, sizeof(drained)), (int64)sizeof(drained));
 

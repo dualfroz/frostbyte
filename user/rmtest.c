@@ -1,18 +1,6 @@
 #include "ulib.h"
 #include "fs.h"
 
-/*
- * Real ring-3 proof of unlink(2)/rmdir(2) as two DISTINCT syscalls
- * (sysUnlink=13, pre-existing; sysRmdir=43, new this fala) through
- * userUnlink/userRmdir (ulib.h), exercising both tmpfs (/tmp) and the
- * persistent on-disk SFS mount (/mnt) to prove vfs.c's dispatch layer
- * enforces the same real POSIX split -- unlink refuses a directory,
- * rmdir refuses anything that is not an EMPTY directory -- on both
- * backing stores, not just one. Fully synchronous like nicetest.c/
- * date.c/timetest.c: no injected keystrokes, no shared shell channel, so
- * there is no scheduling-timing race to flake on regardless of host load.
- */
-
 static int createFile(const char* path)
 {
     int fd = (int)userOpen(path, oReadWrite | oCreate);
@@ -71,10 +59,6 @@ int main(void)
         return 1;
     }
 
-    /* The exact previously-shipped gap this fala closed: unlinking an
-       EMPTY on-disk directory used to silently succeed (sfsRemove's own
-       dir-emptiness check let it through with no type gate above it) --
-       must now be refused, EISDIR-shaped, same as tmpfs above. */
     if (userUnlink("/mnt/rmtest") == 0) {
         print("rmtest: FAIL unlink succeeded on an empty SFS directory\n");
         return 1;

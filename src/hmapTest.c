@@ -19,7 +19,7 @@ KTEST(hmapSetGetOverwrite)
     KT_FALSE(t, hmapHas(&h, "gamma"));
 
     int c = 3;
-    KT_TRUE(t, hmapSet(&h, "alpha", &c));   /* overwrite, not a new entry */
+    KT_TRUE(t, hmapSet(&h, "alpha", &c));
     KT_EQ(t, hmapCount(&h), 2);
     KT_EQP(t, hmapGet(&h, "alpha"), &c);
 
@@ -36,15 +36,13 @@ KTEST(hmapRemove)
     KT_TRUE(t, hmapRemove(&h, "key"));
     KT_EQ(t, hmapCount(&h), 0);
     KT_NULL(t, hmapGet(&h, "key"));
-    KT_FALSE(t, hmapRemove(&h, "key"));   /* already gone */
+    KT_FALSE(t, hmapRemove(&h, "key"));
 
     hmapFree(&h);
 }
 
 KTEST(hmapCollisionsChain)
 {
-    /* force collisions with a tiny bucket count so every key lands in the
-       same chain, exercising the linked-list walk in findSlot */
     Hmap h;
     hmapInit(&h, 1);
 

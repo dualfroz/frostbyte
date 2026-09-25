@@ -1,17 +1,6 @@
 #include "ulib.h"
 #include "fs.h"
 
-/*
- * Real ring-3 proof of chmod(2) + real owner rwx permission bits (fs.h's
- * fsModeOwner*), enforced at the two real choke points this fala added:
- * resolveOpen (vfs.c) refuses to open an existing file for writing without
- * fsModeOwnerWrite, and jobctlSpawn/loadImageByPath (jobctl.c/syscall.c)
- * refuse to spawn a file without fsModeOwnerExec. Fully synchronous like
- * rmtest.c/timetest.c/nicetest.c: no injected keystrokes, no shared shell
- * channel, so there is no scheduling-timing race to flake on regardless of
- * host load.
- */
-
 static int copyFile(const char* srcPath, const char* dstPath)
 {
     int src = (int)userOpen(srcPath, oReadOnly);
@@ -43,11 +32,6 @@ int main(void)
     printDec(userGetpid());
     print("\n");
 
-    /* --- write permission: a fresh tmpfs file starts at fsModeDefaultFile
-       (0644, owner-writable); chmod to 0444 makes a SUBSEQUENT open-for-
-       write fail while reads keep working, and chmod back restores write
-       access immediately -- real Unix only checks permission at open()
-       time, never re-checks an fd already held. --- */
     if (userMkdir("/tmp/permd") != 0) {
         print("permtest: FAIL mkdir /tmp/permd\n");
         return 1;
@@ -112,16 +96,8 @@ int main(void)
     userClose(wfd);
     print("permtest: write-restored-ok\n");
 
-    /* --- exec permission: copying an existing binary's bytes into a NEW
-       tmpfs file (no fork/exec, just plain read+write, like `cp` would)
-       never carries the exec bit over -- the copy starts at the same
-       fsModeDefaultFile every other fresh file gets, exactly like a real
-       shell script you just wrote needs `chmod +x` before `./it` works.
-       Reuses /bin/false (always exits 1) as the payload -- cheap, already
-       built, and its own fixed exit code doubles as proof the COPY, not
-       just some cached original, is what actually ran. --- */
-    if (copyFile("/bin/false", "/tmp/permd/prog") != 0) {
-        print("permtest: FAIL copy /bin/false to prog\n");
+    if (copyFile("/bin/permfalse", "/tmp/permd/prog") != 0) {
+        print("permtest: FAIL copy /bin/permfalse to prog\n");
         return 1;
     }
     if (userStat("/tmp/permd/prog", &st) != 0 || (st.mode & 0100) != 0) {

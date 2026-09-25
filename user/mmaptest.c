@@ -1,19 +1,5 @@
 #include "ulib.h"
 
-/*
- * Live ring-3 proof for mmap.c's real demand-paged mmap(2)/munmap(2),
- * through the actual sysMmap/sysMunmap syscall path (not just mmapTest.c's
- * own in-kernel KTEST coverage, which calls mmap.c's functions directly):
- * anonymous demand-zero fill, a real write landing on that same page, a
- * real file-backed mapping whose content matches the real file it names,
- * (via mmapprotvictim.c) a real SIGSEGV -- not a kernel panic -- when a
- * different process writes to a PROT_READ-only mapping, a real function
- * call succeeding against a mapping that WAS granted PROT_EXEC, and (via
- * mmapexecvictim.c) a real SIGSEGV when a different process jumps into a
- * mapping that was NOT granted it -- the hardware NX enforcement fs.h's
- * own mmapProtExec doc comment used to name as unimplemented.
- */
-
 #define mmapTestPageSize 4096
 
 static int bytesEqual(const volatile unsigned char* a, const char* b, unsigned long n)
@@ -87,17 +73,12 @@ int main(void)
     }
     print("mmaptest: protection-sigsegv-ok\n");
 
-    /* A mapping that WAS granted mmapProtExec really is executable, not
-       just "not actively refused" -- a real function call through it,
-       not merely a read/write, is the only proof that means anything
-       given mmapexecvictim.c below proves the opposite direction. */
     void* execMem = userMmap(0, mmapTestPageSize, mmapProtRead | mmapProtWrite | mmapProtExec,
                               mmapAnonymous, -1, 0);
     if (execMem == userMmapFailed) {
         print("mmaptest: FAIL exec mmap\n");
         return 1;
     }
-    /* x86_64: mov eax, 42; ret -- a real, self-contained function body. */
     unsigned char* code = (unsigned char*)execMem;
     code[0] = 0xB8;
     code[1] = 42;

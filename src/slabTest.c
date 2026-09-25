@@ -17,7 +17,7 @@ KTEST(slabAllocDistinctNonOverlapping)
     KmemCache cache;
     KT_TRUE(t, kmemCacheInit(&cache, "small32", 32));
     KT_GT(t, kmemCacheObjsPerSlab(&cache), 0);
-    KT_EQ(t, kmemCacheCapacity(&cache), 0);   /* nothing grown yet */
+    KT_EQ(t, kmemCacheCapacity(&cache), 0);
 
     void* a = kmemCacheAlloc(&cache);
     void* b = kmemCacheAlloc(&cache);
@@ -30,8 +30,6 @@ KTEST(slabAllocDistinctNonOverlapping)
     KT_NE(t, a, c);
     KT_EQ(t, kmemCacheUsed(&cache), 3);
 
-    /* write a distinct pattern into each object and check none of them
-       stomped on a neighbor */
     memset(a, 0xAA, 32);
     memset(b, 0xBB, 32);
     memset(c, 0xCC, 32);
@@ -59,7 +57,7 @@ KTEST(slabFreeReusesLifo)
     void* a = kmemCacheAlloc(&cache);
     kmemCacheFree(&cache, a);
     void* b = kmemCacheAlloc(&cache);
-    KT_EQP(t, a, b);   /* single-slot free list, must come back the same */
+    KT_EQP(t, a, b);
 
     kmemCacheFree(&cache, b);
     kmemCacheDestroy(&cache);
@@ -74,7 +72,6 @@ KTEST(slabGrowsAcrossMultipleSlabs)
 
     uint64 framesBefore = pmmFreeFrames();
 
-    /* fill exactly the first slab */
     void* first = nullptr;
     for (usize i = 0; i < perSlab; i++) {
         void* p = kmemCacheAlloc(&cache);
@@ -85,7 +82,6 @@ KTEST(slabGrowsAcrossMultipleSlabs)
     KT_EQ(t, kmemCacheSlabCount(&cache), 1);
     KT_EQ(t, kmemCacheUsed(&cache), perSlab);
 
-    /* one more forces a second slab (a second frame from pmm) */
     void* overflow = kmemCacheAlloc(&cache);
     KT_NOTNULL(t, overflow);
     KT_EQ(t, kmemCacheSlabCount(&cache), 2);
@@ -94,7 +90,6 @@ KTEST(slabGrowsAcrossMultipleSlabs)
     KT_NE(t, overflow, first);
 
     kmemCacheDestroy(&cache);
-    /* destroying the cache must return every frame it ever grew into */
     KT_EQ(t, pmmFreeFrames(), framesBefore);
 }
 
@@ -120,15 +115,11 @@ KTEST(slabStressAllocFreePattern)
     }
     KT_EQ(t, kmemCacheUsed(&cache), slabStressCount);
 
-    /* every slot still holds the value we stamped, none aliased */
     for (int i = 0; i < slabStressCount; i++) {
         if (slots[i])
             KT_EQ(t, *(int32*)slots[i], i);
     }
 
-    /* free every third object, then re-allocate that many and confirm the
-       cache handed back exactly that many reclaimed slots (no capacity
-       growth needed to satisfy them) */
     usize freedCount = 0;
     for (int i = 0; i < slabStressCount; i += 3) {
         kmemCacheFree(&cache, slots[i]);

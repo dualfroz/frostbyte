@@ -1,9 +1,6 @@
 #include "ktest.h"
 #include "console.h"
 
-/* Bracketed by the linker script (see linker.ld, .rodata output section):
-   the ".ktests" input section holds one const KtestEntry* per registered
-   test.  Iterating [start, end) visits every test in link order. */
 extern const KtestEntry* const ktestArrayStart[];
 extern const KtestEntry* const ktestArrayEnd[];
 

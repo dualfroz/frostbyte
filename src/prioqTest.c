@@ -2,8 +2,6 @@
 #include "prioq.h"
 #include "heap.h"
 
-/* Fisher-Yates over a small LCG so insertion order is scrambled but
-   reproducible across runs (same generator as rbtTest.c's shuffle). */
 static void shuffle(uint32* arr, int32 n, uint32 seed)
 {
     uint32 state = seed;
@@ -77,7 +75,7 @@ KTEST(prioqTiesBreakByIdAscending)
     PrioQNode nodes[4];
     uint32 ids[] = { 7, 3, 9, 1 };
     for (uint32 i = 0; i < 4; i++)
-        prioqInsert(&q, &nodes[i], 1000, ids[i]); /* identical vruntime */
+        prioqInsert(&q, &nodes[i], 1000, ids[i]);
 
     uint32 expected[] = { 1, 3, 7, 9 };
     for (uint32 i = 0; i < 4; i++) {
@@ -98,7 +96,7 @@ KTEST(prioqRemoveArbitraryNodePreservesOrder)
     for (uint32 i = 0; i < 4; i++)
         prioqInsert(&q, &nodes[i], vruntimes[i], i);
 
-    prioqRemove(&q, &nodes[1]); /* drop vruntime=20 before it is ever popped */
+    prioqRemove(&q, &nodes[1]);
     KT_EQ(t, prioqCount(&q), 3);
 
     uint64 expected[] = { 10, 30, 40 };
@@ -121,9 +119,6 @@ KTEST(prioqNodeStorageIsReusableAcrossQueueLifetimes)
     PrioQNode* popped = prioqPopMin(&first);
     KT_EQP(t, popped, &node);
 
-    /* Same PrioQNode storage, brand new queue: rbtInsert must not be
-       tripped up by stale left/right/parent pointers left over from the
-       first tree. */
     PrioQueue second;
     prioqInit(&second);
     prioqInsert(&second, &node, 5, 1);
@@ -156,8 +151,6 @@ KTEST(prioqStressDrainsInFullyAscendingOrder)
     prioqInit(&q);
     for (uint32 i = 0; i < prioqStressN; i++) {
         uint32 id = order[i];
-        /* vruntime = id * 3 keeps a strict, checkable total order while
-           still exercising ids that arrive in scrambled sequence. */
         prioqInsert(&q, &pool[id], (uint64)id * 3, id);
     }
     KT_EQ(t, prioqCount(&q), prioqStressN);

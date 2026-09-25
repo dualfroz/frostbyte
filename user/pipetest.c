@@ -23,7 +23,6 @@ int main(void)
     int readFd = fds[0];
     int writeFd = fds[1];
 
-    /* nothing written yet: a read must report "would block" (-1), not EOF */
     char probe[4];
     long earlyRead = userRead(readFd, probe, sizeof(probe));
     printLong("pipetest: read before write rc=", earlyRead);
@@ -52,7 +51,6 @@ int main(void)
 
     userClose(writeFd);
 
-    /* buffer is now empty and the write end is closed: true EOF (0) */
     long afterClose = userRead(readFd, probe, sizeof(probe));
     printLong("pipetest: read after writer closed rc=", afterClose);
     if (afterClose != 0) {
@@ -62,7 +60,6 @@ int main(void)
 
     userClose(readFd);
 
-    /* a second independent pipe proves broken-pipe (write with no reader) */
     int fds2[2];
     userPipe(fds2);
     userClose(fds2[0]);

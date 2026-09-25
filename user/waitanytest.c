@@ -1,34 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for waitpid(-1)-style userWaitAny (ulib.c/sched.c's new
- * threadJoinAnyChild) -- proves a parent can reap TWO independently exiting
- * children without ever naming either pid, in whichever order they
- * actually die, and correctly reports ECHILD (-1, no blocking) once none
- * are left.
- *
- * Spawns waitanyfast.c (exits immediately) then waitanyslow.c (sleeps
- * 150ms first), then calls userWaitAny() twice:
- *   - the first call happens essentially immediately after both spawns, so
- *     waitanyslow.c cannot possibly be Dead yet (its own 150ms sleep alone
- *     dwarfs the handful of syscalls in between) -- it must be
- *     waitanyfast.c that gets reaped here, exercising
- *     threadJoinAnyChild's waitScanFoundDead branch without ever blocking.
- *   - the second call therefore has only waitanyslow.c left, which is
- *     genuinely still alive at that point -- it must take the
- *     waitScanNoneDead branch and actually block through sysWait's real
- *     retry-syscall path (schedBlockCurrent(currentThread()), sched.c's
- *     new any-child wake in threadExit) until waitanyslow.c's sleep
- *     elapses and it exits.
- * Verified without leaning on that ordering being guaranteed, though: both
- * reaped pids together must equal exactly {fastPid, slowPid} as a set, and
- * each one's own exit code must match whichever pid it actually was, in
- * whatever order they came back.
- * A third userWaitAny() call, once both children are gone, must return -1
- * immediately (ECHILD) rather than hang forever with no children left to
- * wait for -- proves threadJoinAnyChild's waitScanNoChildren branch live.
- */
-
 int main(void)
 {
     print("waitanytest: start, pid=");

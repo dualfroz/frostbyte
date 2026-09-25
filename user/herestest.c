@@ -1,17 +1,5 @@
 #include "ulib.h"
 
-/*
- * Live ring-3 proof for shell.c's new `cmd <<< TEXT` here-string syntax
- * (jobctl.c's jobctlSpawnForegroundHereString/jobctlSpawnHereStringPiped):
- * from this program's own point of view fd 0 is just an ordinary blocking
- * pipe read end, exactly like pipesink.c's -- it has no idea the other end
- * was ever the SHELL ITSELF writing literal typed text into a pipe rather
- * than another spawned process's stdout. Reads to real EOF, then compares
- * byte-for-byte against the exact text kmain.c's hereDriverThread types
- * after `<<<` plus the single trailing newline jobctlSpawnHereStringPiped
- * always appends (matching a real shell's own `<<<` behavior of feeding
- * the text as one full line, terminator included).
- */
 #define hereStringPayload "hs-ok\n"
 
 static int streq(const char* a, const char* b)

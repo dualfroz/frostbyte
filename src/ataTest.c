@@ -2,14 +2,6 @@
 #include "ata.h"
 #include "string.h"
 
-/*
- * Real hardware coverage for the ATA PIO driver: these tests run against
- * whatever drive QEMU actually attaches on the primary IDE bus (see
- * tools/ci-test.sh / Makefile for the -drive flag), so a wiring mistake in
- * ata.c (wrong port, wrong status bit, off-by-one in the LBA registers)
- * shows up as a real read/write mismatch here, not as a mocked assertion.
- */
-
 static void fillPattern(uint8* buf, uint64 seed)
 {
     for (int i = 0; i < ataSectorSize; i++)
@@ -107,9 +99,6 @@ KTEST(ataOutOfRangeRequestsAreRejected)
     KT_FALSE(t, ataReadSectors(ataSectorCount(), 1, buf));
     KT_FALSE(t, ataWriteSectors(ataSectorCount(), 1, buf));
 
-    /* Buffer is sized for 2 sectors: if the bounds check were buggy and let
-       this through, it would prove itself by corrupting the canary sector
-       instead of silently passing. */
     uint8 twoSectors[2 * ataSectorSize];
     KT_FALSE(t, ataReadSectors(ataSectorCount() - 1, 2, twoSectors));
 }

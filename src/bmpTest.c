@@ -9,7 +9,7 @@ KTEST(bmpSetClearTest)
 
     KT_FALSE(t, bmpTest(&b, 0));
     KT_FALSE(t, bmpTest(&b, 63));
-    KT_FALSE(t, bmpTest(&b, 64));   /* crosses into the second word */
+    KT_FALSE(t, bmpTest(&b, 64));
     KT_FALSE(t, bmpTest(&b, 99));
 
     bmpSet(&b, 0);
@@ -34,7 +34,7 @@ KTEST(bmpOutOfRangeIsSafeNoop)
     Bitmap b;
     bmpInit(&b, words, 10);
 
-    bmpSet(&b, 500);          /* must not touch memory past backing storage */
+    bmpSet(&b, 500);
     KT_FALSE(t, bmpTest(&b, 500));
     bmpClear(&b, 500);
     KT_EQ(t, bmpCountSet(&b), 0);
@@ -46,14 +46,14 @@ KTEST(bmpRangeOps)
     Bitmap b;
     bmpInit(&b, words, 20);
 
-    bmpSetRange(&b, 5, 10);   /* bits 5..14 */
+    bmpSetRange(&b, 5, 10);
     KT_EQ(t, bmpCountSet(&b), 10);
     KT_FALSE(t, bmpTest(&b, 4));
     KT_TRUE(t, bmpTest(&b, 5));
     KT_TRUE(t, bmpTest(&b, 14));
     KT_FALSE(t, bmpTest(&b, 15));
 
-    bmpClearRange(&b, 5, 3);   /* clears 5,6,7 */
+    bmpClearRange(&b, 5, 3);
     KT_FALSE(t, bmpTest(&b, 5));
     KT_FALSE(t, bmpTest(&b, 7));
     KT_TRUE(t, bmpTest(&b, 8));

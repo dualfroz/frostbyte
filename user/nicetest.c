@@ -1,24 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for sysNice/sysGetPriority (syscall.c), the first way
- * for any real userspace process to reach sched.h's CFS-lite scheduling
- * weight -- until this fala, threadSetPriority was reachable only from
- * kmain.c itself, once, to set up the kernel-internal workerA/workerB
- * "higher weight runs more often" demo (sched-priority-ok's own needle).
- * That demo already proves the SCHEDULER honors weight; this one proves
- * the SYSCALL PLUMBING that lets userspace change it does the right thing:
- * pid==0 self-targeting, targeting a real separate process (including one
- * that is genuinely Sleeping, not just Runnable), and every rejection path
- * (bogus pid, zero weight, an already-reaped pid) sysKill's own
- * killtest.c already established the shape for.
- *
- * Fully synchronous, like cwdtest.c/cwdtarget.c: every step is ordered by
- * a real userSleep/userWait, never an injected keystroke or a pipe
- * rendezvous, so unlike most of this kernel's other live demos this one
- * has no scheduling-timing race to flake on at all.
- */
-
 int main(void)
 {
     print("nicetest: start, pid=");
@@ -57,21 +38,38 @@ int main(void)
     }
     print("nicetest: self-renice-ok\n");
 
-    /* Restore the original weight before moving on -- nothing downstream
-       depends on it, just honest hygiene rather than leaving this process
-       double-weighted for the rest of its own run. */
     userNice(0, before);
 
-    long target = userSpawn("/bin/nicetarget", 0);
+    long readyHandle = userPipeCreate();
+    long goHandle = userPipeCreate();
+    if (readyHandle < 0 || goHandle < 0) {
+        print("nicetest: FAIL create handshake pipes\n");
+        return 1;
+    }
+    long readyFd = userPipeAttach(readyHandle, 0);
+    long goFd = userPipeAttach(goHandle, 1);
+    if (readyFd < 0 || goFd < 0) {
+        print("nicetest: FAIL attach handshake pipes\n");
+        return 1;
+    }
+
+    char readyHandleStr[24];
+    char goHandleStr[24];
+    decToString(readyHandle, readyHandleStr);
+    decToString(goHandle, goHandleStr);
+    char* targetArgv[] = { "/bin/nicetarget", readyHandleStr, goHandleStr, 0 };
+    long target = userSpawn("/bin/nicetarget", targetArgv);
     if (target < 0) {
         print("nicetest: FAIL spawn nicetarget\n");
         return 1;
     }
 
-    /* Give nicetarget time to actually reach its own sleep before touching
-       it -- same reasoning as killtest.c's own userSleep(100) before
-       killing its victim mid-syscall. */
-    userSleep(100);
+    char readyByte;
+    if (userRead((int)readyFd, &readyByte, 1) != 1) {
+        print("nicetest: FAIL read ready byte\n");
+        return 1;
+    }
+    userClose((int)readyFd);
 
     if (userNice(target, 4096) != 0) {
         print("nicetest: FAIL renice nicetarget while sleeping\n");
@@ -84,6 +82,12 @@ int main(void)
     }
     print("nicetest: other-renice-ok\n");
 
+    if (userWrite((int)goFd, "g", 1) != 1) {
+        print("nicetest: FAIL write go byte\n");
+        return 1;
+    }
+    userClose((int)goFd);
+
     long status = userWait(target);
     print("nicetest: nicetarget exit status=");
     printDec(status);
@@ -93,10 +97,6 @@ int main(void)
         return 1;
     }
 
-    /* Already dead and reaped (userWait above reaped it): renicing it
-       again must fail cleanly, not resurrect a slot that has since been
-       reused -- same "kill an already-reaped pid" shape killtest.c's own
-       last check has. */
     if (userNice(target, 1024) != -1) {
         print("nicetest: FAIL renice of already-reaped pid should fail\n");
         return 1;

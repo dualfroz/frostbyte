@@ -39,7 +39,7 @@ KTEST(klibStrCopyCat)
     KT_EQ(t, nbuf[0], 'h');
     KT_EQ(t, nbuf[1], 'i');
     KT_EQ(t, nbuf[2], 0);
-    KT_EQ(t, nbuf[7], 0);   /* strncpy pads the remainder with nul */
+    KT_EQ(t, nbuf[7], 0);
 
     char abuf[16];
     strcpy(abuf, "ab");
@@ -56,7 +56,7 @@ KTEST(klibStrSearch)
     KT_NOTNULL(t, strstr(s, "brown"));
     KT_STREQ(t, strstr(s, "brown"), "brown fox");
     KT_NULL(t, strstr(s, "purple"));
-    KT_STREQ(t, strstr(s, ""), s);   /* empty needle matches at start */
+    KT_STREQ(t, strstr(s, ""), s);
 
     KT_EQ(t, strspn("aaabbbccc", "ab"), 6);
     KT_EQ(t, strcspn("hello, world", ", "), 5);
@@ -73,7 +73,7 @@ KTEST(klibStrTokR)
     tok = strTokR(nullptr, ",", &save);
     KT_STREQ(t, tok, "two");
     tok = strTokR(nullptr, ",", &save);
-    KT_STREQ(t, tok, "four");   /* empty field between two commas is skipped */
+    KT_STREQ(t, tok, "four");
     tok = strTokR(nullptr, ",", &save);
     KT_NULL(t, tok);
 }
@@ -92,14 +92,14 @@ KTEST(klibNumberParsing)
     KT_EQ(t, strtol("-15", nullptr, 10), -15);
     KT_EQ(t, strtol("ff", nullptr, 16), 255);
     KT_EQ(t, strtol("0x1A", nullptr, 0), 26);
-    KT_EQ(t, strtol("010", nullptr, 0), 8);   /* auto-detected octal */
+    KT_EQ(t, strtol("010", nullptr, 0), 8);
     KT_EQ(t, strtol("42", nullptr, 0), 42);
 
     KT_EQU(t, strtoul("ffff", nullptr, 16), 65535);
 
     end = nullptr;
     strtol("nope", &end, 10);
-    KT_STREQ(t, end, "nope");   /* no digits consumed: endptr == start */
+    KT_STREQ(t, end, "nope");
 }
 
 static int intCmp(const void* a, const void* b)
@@ -153,14 +153,11 @@ KTEST(klibSnprintf)
     snprintf(buf, sizeof(buf), "100%%");
     KT_STREQ(t, buf, "100%");
 
-    /* truncation: buffer smaller than the formatted result still nul
-       terminates, and reports the length that would have been written */
     char small[4];
     int wanted = snprintf(small, sizeof(small), "hello");
     KT_STREQ(t, small, "hel");
     KT_EQ(t, wanted, 5);
 
-    /* size == 0 must not touch the buffer at all, and still reports length */
     int wantedZero = snprintf(nullptr, 0, "hello");
     KT_EQ(t, wantedZero, 5);
 }

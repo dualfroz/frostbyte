@@ -54,14 +54,11 @@ KTEST(pipeFullWriteWouldBlockThenDrainsAndAcceptsMore)
     uint8 chunk[pipeBufferSize];
     memset(chunk, 0xAB, sizeof(chunk));
 
-    /* this exactly fills the ring. */
     int64 filled = pipeWrite(h, chunk, sizeof(chunk));
     KT_EQ(t, filled, (int64)sizeof(chunk));
 
-    /* buffer is full: further write must report "would block" */
     KT_EQ(t, pipeWrite(h, chunk, 1), -1);
 
-    /* drain some bytes, then more space is available */
     uint8 drained[64];
     int64 gotDrain = pipeRead(h, drained, sizeof(drained));
     KT_EQ(t, gotDrain, (int64)sizeof(drained));
@@ -85,12 +82,10 @@ KTEST(pipeEofAfterWriterClosedAndBufferDrained)
 
     pipeCloseWrite(h);
 
-    /* data queued before close is still readable */
     char buffer[32];
     int64 got = pipeRead(h, buffer, sizeof(buffer));
     KT_EQ(t, got, (int64)strlen(msg));
 
-    /* now drained and no writer left: true end-of-file, not "would block" */
     KT_EQ(t, pipeRead(h, buffer, sizeof(buffer)), 0);
     KT_EQ(t, pipeRead(h, buffer, sizeof(buffer)), 0);
 
@@ -119,7 +114,6 @@ KTEST(pipeInvalidHandleIsRejected)
     KT_EQ(t, pipeRead(-1, buffer, sizeof(buffer)), -1);
     KT_EQ(t, pipeWrite(-1, buffer, sizeof(buffer)), -1);
 
-    /* closing an invalid handle must not crash */
     pipeCloseRead(-1);
     pipeCloseWrite(999);
 }
@@ -164,11 +158,9 @@ KTEST(pipeTableExhaustionAndReuse)
         handles[created++] = h;
     }
 
-    /* the table must run out before maxPipes+1 succeed */
     KT_LT(t, created, maxPipes + 1);
     KT_EQ(t, pipeCreate(), -1);
 
-    /* fully closing one pipe frees its slot for reuse */
     pipeCloseRead(handles[0]);
     pipeCloseWrite(handles[0]);
     int reused = pipeCreate();

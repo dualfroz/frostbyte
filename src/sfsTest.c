@@ -7,14 +7,6 @@
 #include "rtc.h"
 #include "fs.h"
 
-/*
- * Every test starts with an explicit sfsFormat() so results do not depend on
- * whatever build/disk.img happened to contain from a previous `make test`
- * run (the disk image is not recreated between runs unless deleted). That
- * keeps the gate deterministic: a stale leftover file on disk must never be
- * the reason a check passes or fails.
- */
-
 KTEST(sfsFormatAndMountAreReal)
 {
     if (!KT_TRUE(t, ataPresent()))
@@ -91,9 +83,6 @@ KTEST(sfsMultiBlockFileSpansDirectPointers)
     int32 f = sfsCreateFile("multi.bin");
     KT_TRUE(t, f > 0);
 
-    /* Big enough to span several blocks: kmalloc'd rather than kept on the
-       stack, matching the rbt/slab stress-test convention (this ktest
-       battery runs on the fixed 16 KiB boot stack, not a per-thread one). */
     #define sfsTestSpan (3 * sfsBlockSize + 200)
     uint8* pattern = (uint8*)kmalloc(sfsTestSpan);
     uint8* back = (uint8*)kmalloc(sfsTestSpan);
@@ -127,10 +116,6 @@ KTEST(sfsFileGrowsThroughIndirectBlock)
     int32 f = sfsCreateFile("big.bin");
     KT_TRUE(t, f > 0);
 
-    /* 10 direct blocks (5120 bytes) plus a chunk that only the single
-       indirect block can address: this must reach past sfsDirectBlocks.
-       kmalloc'd (three of these at once would be ~18 KiB, more than the
-       whole 16 KiB boot stack ktest runs on). */
     #define sfsBigSpan (12 * sfsBlockSize + 33)
     uint8* pattern = (uint8*)kmalloc(sfsBigSpan);
     uint8* back = (uint8*)kmalloc(sfsBigSpan);
@@ -154,8 +139,6 @@ KTEST(sfsFileGrowsThroughIndirectBlock)
     KT_EQ(t, sfsReadAt(f, 0, back, sfsBigSpan), sfsBigSpan);
     KT_EQ(t, memcmp(back, pattern, sfsBigSpan), 0);
 
-    /* Overwrite a slice that straddles the direct/indirect boundary and
-       confirm only that slice changes. */
     uint8 patch[64];
     memset(patch, 0xEE, sizeof(patch));
     uint64 patchOffset = 10 * sfsBlockSize - 20;
@@ -221,9 +204,6 @@ KTEST(sfsRemoveFileFreesBlocksForReuse)
     KT_TRUE(t, sfsRemove("tofree.bin"));
     KT_EQ(t, sfsLookup("tofree.bin"), -1);
 
-    /* A same-size file created afterward must succeed, proving the blocks
-       (and the inode slot) actually came back to the free pool rather than
-       leaking on every create/remove cycle. */
     int32 again = sfsCreateFile("tofree.bin");
     KT_TRUE(t, again > 0);
     KT_EQ(t, sfsSizeOf(again), 0);
@@ -304,10 +284,6 @@ KTEST(sfsTruncateShrinksAndFreesBlocks)
 
 KTEST(sfsPersistsAcrossUnmountRemount)
 {
-    /* The real point of this test: sfsUnmount() drops every in-memory
-       structure (bitmaps freed, mounted flag cleared). If sfsMount() can
-       still find the file and its exact bytes afterward, the filesystem is
-       genuinely backed by disk, not by a cache that happens to survive. */
     if (!KT_TRUE(t, sfsFormat()))
         return;
 
@@ -336,9 +312,6 @@ KTEST(sfsPersistsAcrossUnmountRemount)
 
 KTEST(sfsMountWithoutFormatRecoversPriorState)
 {
-    /* sfsMount() on an already-formatted disk must NOT reformat: a second
-       mount call has to see the first mount's data, exactly like a real
-       reboot re-mounting an existing filesystem. */
     if (!KT_TRUE(t, sfsFormat()))
         return;
 
@@ -354,18 +327,6 @@ KTEST(sfsMountWithoutFormatRecoversPriorState)
     KT_EQ(t, sfsReadAt(found, 0, back, 10), 10);
     KT_EQ(t, memcmp(back, "still here", 10), 0);
 }
-
-/*
- * mtime/ctime coverage below. Every bound uses a real rtcNow() reading taken
- * strictly before or after the operation under test, in this same thread, so
- * "before <= stamped-value <= after" is a real chronological fact (the clock
- * only ever moves forward), never a flaky timing assumption -- unlike a
- * cross-run "did it increase" check, which would need a real elapsed second
- * to be meaningful. sfsLinkBumpsCtimeButNeverTouchesMtime instead checks
- * exact, timing-independent equality: the link code path must never write
- * inode.mtime at all, so it has to come back byte-for-byte unchanged
- * regardless of how much wall-clock time passed.
- */
 
 KTEST(sfsCreateFileStampsMtimeAndCtimeNearNow)
 {
@@ -456,10 +417,6 @@ KTEST(sfsRemoveOneOfTwoHardlinksBumpsRemainingLinkCtime)
 
 KTEST(sfsPersistsMtimeAndCtimeAcrossUnmountRemount)
 {
-    /* Same real point as sfsPersistsAcrossUnmountRemount above, applied to
-       the new fields: sfsUnmount() drops every in-memory structure, so an
-       exact match after sfsMount() proves these timestamps genuinely live on
-       disk inside the inode, not in some cache that happens to survive. */
     if (!KT_TRUE(t, sfsFormat()))
         return;
 
@@ -481,12 +438,6 @@ KTEST(sfsPersistsMtimeAndCtimeAcrossUnmountRemount)
     KT_EQ(t, sfsCtimeOf(reloaded), ctimeBefore);
 }
 
-/* Real chmod(2) owner rwx bits (fs.h's fsModeOwner*): createNode stamps a
-   type-based default (a file gets fsModeDefaultFile, a directory gets
-   fsModeDefaultDir), sfsChmod overwrites it and bumps ctime like any other
-   metadata-only mutation (sfsLink's linkCount bump does the same, see
-   above), and sfsModeOf/sfsChmod on an invalid inode number fail the same
-   way sfsSizeOf/sfsTypeOf already do for one. */
 KTEST(sfsModeDefaultsByTypeAndChmodBumpsCtime)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -518,10 +469,6 @@ KTEST(sfsModeDefaultsByTypeAndChmodBumpsCtime)
     KT_FALSE(t, sfsChmod(9999, 0644));
 }
 
-/* Same real point as sfsPersistsMtimeAndCtimeAcrossUnmountRemount above,
-   applied to mode: sfsUnmount() drops every in-memory structure, so an
-   exact match after sfsMount() proves the chmod'd value genuinely lives on
-   disk inside the inode, not in some cache that happens to survive. */
 KTEST(sfsPersistsModeAcrossUnmountRemount)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -540,16 +487,6 @@ KTEST(sfsPersistsModeAcrossUnmountRemount)
     KT_EQ(t, sfsModeOf(reloaded), 0400u);
 }
 
-/* Real owner identity (fs.h's FbStat.uid, sched.h's currentThreadUid()):
-   createNode stamps every new node -- file, dir, symlink, fifo all go
-   through it, exactly like mtime/ctime already verified sufficient for
-   (FALA 39's own note) -- with whoever is CURRENT at creation time.
-   ktestRunAll always runs as the permanent idle thread (id 0, uid 0), the
-   same context schedTest.c's own uid-default tests already document
-   relying on, so both a freshly created file and the root inode itself
-   (sfsFormat, this test's own sfsFormat() call included) come back
-   root-owned. sfsUidOf on an invalid inode number fails the same way
-   sfsModeOf/sfsSizeOf/sfsTypeOf already do for one. */
 KTEST(sfsCreateNodeStampsCreatorUidAsOwner)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -571,10 +508,6 @@ KTEST(sfsCreateNodeStampsCreatorUidAsOwner)
     KT_EQU(t, sfsUidOf(9999), 0u);
 }
 
-/* Same real point as sfsPersistsModeAcrossUnmountRemount above, applied to
-   uid: sfsUnmount() drops every in-memory structure, so an exact match
-   after sfsMount() proves ownership genuinely lives on disk inside the
-   inode, not in some cache that happens to survive. */
 KTEST(sfsPersistsUidAcrossUnmountRemount)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -593,13 +526,6 @@ KTEST(sfsPersistsUidAcrossUnmountRemount)
     KT_EQU(t, sfsUidOf(reloaded), 0u);
 }
 
-/* Real chown(2)'s on-disk half (sfsChown): overwrites the inode's owner
-   uid outright and bumps ctime like sfsChmod's own metadata-only mutation
-   does -- same "bump ctime, invalid inode fails the same way" shape as
-   sfsModeDefaultsByTypeAndChmodBumpsCtime above. sfsChown itself has no
-   privilege check (vfsChown, vfs.c, is the real choke point that enforces
-   chown(2)'s root-only rule), so calling it directly here at any uid is
-   deliberately not restricted. */
 KTEST(sfsChownReassignsOwnerAndBumpsCtime)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -624,10 +550,6 @@ KTEST(sfsChownReassignsOwnerAndBumpsCtime)
     KT_FALSE(t, sfsChown(9999, 1000));
 }
 
-/* Same real point as sfsPersistsUidAcrossUnmountRemount above, but for a
-   uid REASSIGNED by sfsChown after creation, not just the creation-time
-   default -- proves the chown write path itself lands on disk, not just
-   that createNode's own initial stamp does. */
 KTEST(sfsPersistsChownedUidAcrossUnmountRemount)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -646,10 +568,6 @@ KTEST(sfsPersistsChownedUidAcrossUnmountRemount)
     KT_EQU(t, sfsUidOf(reloaded), 8123u);
 }
 
-/* Real chgrp(2)'s on-disk half (sfsChgrp), mirroring
-   sfsChownReassignsOwnerAndBumpsCtime exactly one field over -- same "no
-   privilege check of its own, ctime bumps, invalid inode fails the same
-   way" shape. */
 KTEST(sfsChgrpReassignsGroupAndBumpsCtime)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -674,8 +592,6 @@ KTEST(sfsChgrpReassignsGroupAndBumpsCtime)
     KT_FALSE(t, sfsChgrp(9999, 1000));
 }
 
-/* Same real point as sfsPersistsChownedUidAcrossUnmountRemount above, one
-   field over: proves the chgrp write path itself lands on disk. */
 KTEST(sfsPersistsChgrpedGidAcrossUnmountRemount)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -694,20 +610,13 @@ KTEST(sfsPersistsChgrpedGidAcrossUnmountRemount)
     KT_EQU(t, sfsGidOf(reloaded), 7124u);
 }
 
-/* Real directory-write enforcement at the on-disk choke point (sfs.c's
-   createNode, shared by sfsCreateFile/sfsCreateDir/sfsCreateFifo/
-   sfsCreateSymlink) -- mirrors coreTest.c's tmpfs
-   coreVfsMkdirAndCreateRequireParentWrite for the SFS backing store.
-   ktestRunAll always runs as uid 0, and vfsPermitted has no uid-0 bypass,
-   so removing the parent's own owner-write bit denies even its own
-   creator/owner. */
 KTEST(sfsCreateNodeRequiresParentWrite)
 {
     if (!KT_TRUE(t, sfsFormat()))
         return;
 
     KT_TRUE(t, sfsCreateDir("dwparent") > 0);
-    KT_TRUE(t, sfsChmod(sfsLookup("dwparent"), 0555));   /* r-x, no owner-write */
+    KT_TRUE(t, sfsChmod(sfsLookup("dwparent"), 0555));
 
     KT_EQ(t, sfsCreateFile("dwparent/f"), -1);
     KT_EQ(t, sfsCreateDir("dwparent/sub"), -1);
@@ -717,10 +626,6 @@ KTEST(sfsCreateNodeRequiresParentWrite)
     KT_TRUE(t, sfsCreateDir("dwparent/sub") > 0);
 }
 
-/* Same parent-write rule applied to sfsLink -- adding a new hardlink NAME
-   is a directory-entry creation exactly like sfsCreateFile, so it needs
-   write permission on the PARENT of the new name, not any permission on
-   the existing target being linked to. */
 KTEST(sfsLinkRequiresParentWriteOnNewName)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -736,10 +641,6 @@ KTEST(sfsLinkRequiresParentWriteOnNewName)
     KT_TRUE(t, sfsLink("lwtarget.txt", "lwparent/alias") > 0);
 }
 
-/* Real unlink(2)/rmdir(2) semantics at the on-disk choke point (sfs.c's
-   sfsRemove) -- mirrors coreTest.c's tmpfs
-   coreVfsUnlinkAndRmdirRequireParentWrite: removing an entry needs write
-   permission on the PARENT, never the entry's own mode. */
 KTEST(sfsRemoveRequiresParentWrite)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -755,11 +656,6 @@ KTEST(sfsRemoveRequiresParentWrite)
     KT_TRUE(t, sfsRemove("rwparent/f"));
 }
 
-/* Real POSIX search permission at the on-disk choke point (sfs.c's
-   lookupFrom, checked on every directory ANCESTOR a path walks through) --
-   mirrors coreTest.c's tmpfs coreVfsLookupRequiresAncestorExec. Removing
-   the exec bit on an ancestor makes every lookup THROUGH it fail even
-   though the target inode itself never changed. */
 KTEST(sfsLookupRequiresAncestorExec)
 {
     if (!KT_TRUE(t, sfsFormat()))
@@ -769,7 +665,7 @@ KTEST(sfsLookupRequiresAncestorExec)
     int32 leaf = sfsCreateFile("xancestor/leaf");
     KT_TRUE(t, leaf > 0);
 
-    KT_TRUE(t, sfsChmod(sfsLookup("xancestor"), 0600));   /* rw-, no exec */
+    KT_TRUE(t, sfsChmod(sfsLookup("xancestor"), 0600));
     KT_EQ(t, sfsLookup("xancestor/leaf"), -1);
 
     KT_TRUE(t, sfsChmod(sfsLookup("xancestor"), fsModeDefaultDir));
@@ -791,8 +687,6 @@ KTEST(sfsSymlinkResolvesToTargetFile)
     KT_TRUE(t, link > 0);
     KT_NE(t, link, f);
 
-    /* sfsLookup follows the symlink: it must land on the SAME inode as
-       looking the real file up directly, not a copy of it. */
     KT_EQ(t, sfsLookup("link.txt"), f);
     KT_EQ(t, sfsTypeOf(sfsLookup("link.txt")), sfsTypeFile);
 
@@ -817,8 +711,6 @@ KTEST(sfsReadlinkReturnsStoredTargetAndNoFollowSeesTheLinkItself)
     KT_TRUE(t, sfsReadlink(link, target, sizeof(target)));
     KT_STREQ(t, target, "real.txt");
 
-    /* No-follow gives back the symlink's own inode (and its own type),
-       distinct from what sfsLookup (which follows) would give. */
     int32 noFollow = sfsLookupNoFollow("link.txt");
     KT_EQ(t, noFollow, link);
     KT_EQ(t, sfsTypeOf(noFollow), sfsTypeSymlink);
@@ -856,14 +748,9 @@ KTEST(sfsSymlinkToDirectoryAllowsDescendingThroughIt)
     KT_TRUE(t, link > 0);
     KT_EQ(t, sfsTypeOf(link), sfsTypeSymlink);
 
-    /* The symlink is an INTERMEDIATE component here (there is more path
-       after it), which must still be followed even though sfsLookup's
-       "final component" special case does not apply. */
     int32 viaLink = sfsLookup("linkdir/inside.txt");
     KT_EQ(t, viaLink, f);
 
-    /* Creating a new file through the symlinked directory must land in the
-       real directory, reachable from both paths. */
     KT_TRUE(t, sfsCreateFile("linkdir/new.txt") > 0);
     KT_EQ(t, sfsLookup("realdir/new.txt"), sfsLookup("linkdir/new.txt"));
 }
@@ -892,13 +779,9 @@ KTEST(sfsSymlinkCycleFailsCleanlyInsteadOfHanging)
     KT_TRUE(t, sfsCreateSymlink("a", "b") > 0);
     KT_TRUE(t, sfsCreateSymlink("b", "a") > 0);
 
-    /* The whole point: this must return with an error, not recurse forever
-       (or overflow the caller's stack) chasing a->b->a->b->... */
     KT_EQ(t, sfsLookup("a"), -1);
     KT_EQ(t, sfsLookup("b"), -1);
 
-    /* The table must still be in a usable state afterward - a failed
-       resolution is not the same thing as a corrupted filesystem. */
     KT_TRUE(t, sfsCreateFile("stillworks.txt") > 0);
 }
 
@@ -914,8 +797,6 @@ KTEST(sfsCreateSymlinkRejectsEmptyOrOversizedTarget)
     huge[sizeof(huge) - 1] = 0;
     KT_EQ(t, sfsCreateSymlink("huge.txt", huge), -1);
 
-    /* Rejected attempts must not leave a half-created inode or directory
-       entry behind. */
     KT_EQ(t, sfsLookupNoFollow("empty.txt"), -1);
     KT_EQ(t, sfsLookupNoFollow("huge.txt"), -1);
 }
@@ -933,8 +814,6 @@ KTEST(sfsRemoveSymlinkDoesNotAffectTarget)
     KT_TRUE(t, sfsRemove("link.txt"));
     KT_EQ(t, sfsLookupNoFollow("link.txt"), -1);
 
-    /* The target must survive with its data intact - unlink of a symlink
-       must never recurse into what it points at. */
     int32 stillThere = sfsLookup("real.txt");
     KT_EQ(t, stillThere, f);
     char back[16];
@@ -975,13 +854,6 @@ KTEST(sfsFileGrowsThroughDoubleIndirectBlock)
     int32 f = sfsCreateFile("huge.bin");
     KT_TRUE(t, f > 0);
 
-    /* sfsDirectBlocks (10) + sfsPtrsPerBlock (128) = 138 logical blocks are
-       reachable through direct + single indirect addressing; block 138
-       onward can only be reached through the double indirect block added
-       in this wave. Starting a few blocks before that boundary and writing
-       past it exercises the crossing and the double-indirect-only region
-       in one write (sfsWriteAt zero-fills 0..134 first, all still within
-       single-indirect range, before this pattern lands on 135..144). */
     #define sfsDoubleSpanBlocks 10
     #define sfsDoubleStartBlock 135
     #define sfsDoubleSpan (sfsDoubleSpanBlocks * sfsBlockSize)
@@ -1005,10 +877,6 @@ KTEST(sfsFileGrowsThroughDoubleIndirectBlock)
     KT_EQ(t, sfsReadAt(f, offset, verify, sfsDoubleSpan), sfsDoubleSpan);
     KT_EQ(t, memcmp(verify, pattern, sfsDoubleSpan), 0);
 
-    /* Patch a window straddling the single-indirect/double-indirect
-       boundary itself (logical block 137/138) and confirm only that slice
-       changed -- the same "boundary patch" shape as
-       sfsFileGrowsThroughIndirectBlock, one level deeper. */
     uint8 patch[48];
     memset(patch, 0xCC, sizeof(patch));
     uint64 patchOffset = 138 * sfsBlockSize - 24;
@@ -1034,13 +902,6 @@ KTEST(sfsTruncateFreesDoubleIndirectBlocks)
     int32 f = sfsCreateFile("hugeshrink.bin");
     KT_TRUE(t, f > 0);
 
-    /* Baseline is taken AFTER creating the file, not before: creating the
-       very first entry in a previously-empty root directory grows the
-       root's own data block permanently (it is a directory entry, not file
-       content, and stays even after truncating the FILE back to empty) --
-       that is correct, unrelated bookkeeping this test must not conflate
-       with whether truncating hugeshrink.bin's own content gives its
-       blocks back. */
     uint64 baseline = sfsFreeDataBlocks();
     KT_GT(t, baseline, 0);
 
@@ -1059,18 +920,12 @@ KTEST(sfsTruncateFreesDoubleIndirectBlocks)
     #undef sfsShrinkStartBlock
     #undef sfsShrinkSpanBlocks
 
-    /* This file now owns: 10 direct + 1 single-indirect holder + 128
-       single-indirect data blocks + 1 double-indirect holder + 1 inner
-       indirect holder + a handful of double-indirect data blocks. Every
-       one of those must come back. */
     KT_LT(t, sfsFreeDataBlocks(), baseline);
 
     KT_TRUE(t, sfsTruncate(f, 0));
     KT_EQ(t, sfsSizeOf(f), 0);
     KT_EQU(t, sfsFreeDataBlocks(), baseline);
 
-    /* And the inode itself must still be usable afterward, not left in some
-       half-truncated state. */
     KT_EQ(t, sfsWriteAt(f, 0, "reused", 6), 6);
     KT_EQ(t, sfsSizeOf(f), 6);
 }
@@ -1083,20 +938,6 @@ KTEST(sfsFileGrowsThroughTripleIndirectBlock)
     int32 f = sfsCreateFile("huger.bin");
     KT_TRUE(t, f > 0);
 
-    /* sfsDirectBlocks (10) + sfsPtrsPerBlock (128) + sfsPtrsPerBlock^2
-       (16384) = 16522 logical blocks are reachable through direct + single
-       + double indirect addressing; block 16522 onward can only be reached
-       through the triple indirect block added in this wave. Physically
-       reaching that boundary with real writes from offset 0 would mean
-       sfsWriteAt zero-filling ~8 MiB of real leading blocks first (its own
-       "no sparse holes" contract, see its doc comment) -- correct, but far
-       too slow for a headless boot-time gate. sfsTruncate's own grow path
-       is a genuine sparse hole instead (see sfsTruncateInode: growing only
-       ever rewrites the size field, no block is touched), the same
-       lseek-past-EOF-then-write shape a real filesystem's holes have -- so
-       pre-growing with it reaches the boundary for free, in O(1), then a
-       real write of a handful of blocks exercises the actual double/triple
-       crossing without paying for the untouched blocks in between. */
     #define sfsTripleBoundaryBlock 16522
     #define sfsTripleSpanBlocks 12
     #define sfsTripleStartBlock (sfsTripleBoundaryBlock - 6)
@@ -1117,9 +958,6 @@ KTEST(sfsFileGrowsThroughTripleIndirectBlock)
     for (int i = 0; i < sfsTripleSpan; i++)
         pattern[i] = (uint8)(i * 29 + 7);
 
-    /* Six blocks land in the double-indirect region (16516..16521), the
-       other six only exist through the new triple-indirect block
-       (16522..16527) -- one write straddles both. */
     KT_EQ(t, sfsWriteAt(f, startOffset, pattern, sfsTripleSpan), sfsTripleSpan);
     KT_EQ(t, sfsSizeOf(f), startOffset + sfsTripleSpan);
 
@@ -1127,9 +965,6 @@ KTEST(sfsFileGrowsThroughTripleIndirectBlock)
     KT_EQ(t, sfsReadAt(f, startOffset, verify, sfsTripleSpan), sfsTripleSpan);
     KT_EQ(t, memcmp(verify, pattern, sfsTripleSpan), 0);
 
-    /* Patch a window straddling the double-indirect/triple-indirect
-       boundary itself (logical block 16521/16522) -- same "boundary patch"
-       shape as sfsFileGrowsThroughDoubleIndirectBlock, one level deeper. */
     uint8 patch[48];
     memset(patch, 0xAB, sizeof(patch));
     uint64 patchOffset = (uint64)sfsTripleBoundaryBlock * sfsBlockSize - 24;
@@ -1156,22 +991,9 @@ KTEST(sfsTruncateFreesTripleIndirectBlocks)
     int32 f = sfsCreateFile("hugershrink.bin");
     KT_TRUE(t, f > 0);
 
-    /* Baseline taken after creating the file, same reasoning as
-       sfsTruncateFreesDoubleIndirectBlocks: the root directory's own data
-       block is unrelated bookkeeping this test must not conflate with
-       hugershrink.bin's own content. */
     uint64 baseline = sfsFreeDataBlocks();
     KT_GT(t, baseline, 0);
 
-    /* Grow straight to the triple-indirect boundary via sfsTruncate (O(1),
-       a genuine sparse hole -- see sfsFileGrowsThroughTripleIndirectBlock
-       above) and write ENTIRELY inside the triple-indirect region, never
-       touching a single/double-indirect block. That keeps inode->indirect
-       and inode->doubleIndirect at 0, so the shrink-to-0 below only ever
-       does a cheap in-memory "still unallocated" check across the whole
-       single+double logical range instead of re-reading real holder blocks
-       for it -- proportional to the actual work, not to how far into the
-       address space the file happens to reach. */
     #define sfsTripleBoundaryBlock 16522
     #define sfsShrink2SpanBlocks 8
     #define sfsShrink2Span (sfsShrink2SpanBlocks * sfsBlockSize)
@@ -1189,16 +1011,12 @@ KTEST(sfsTruncateFreesTripleIndirectBlocks)
     #undef sfsShrink2SpanBlocks
     #undef sfsTripleBoundaryBlock
 
-    /* This file now owns: 1 triple-indirect holder + 1 mid holder + 1
-       leaf-pointer holder + a handful of triple-indirect data blocks.
-       Every one of those must come back. */
     KT_LT(t, sfsFreeDataBlocks(), baseline);
 
     KT_TRUE(t, sfsTruncate(f, 0));
     KT_EQ(t, sfsSizeOf(f), 0);
     KT_EQU(t, sfsFreeDataBlocks(), baseline);
 
-    /* And the inode itself must still be usable afterward. */
     KT_EQ(t, sfsWriteAt(f, 0, "reused", 6), 6);
     KT_EQ(t, sfsSizeOf(f), 6);
 }
@@ -1220,9 +1038,6 @@ KTEST(sfsHardlinkSharesInodeAndData)
     KT_EQ(t, sfsLinkCountOf(f), 2);
     KT_EQ(t, sfsLookup("alias.txt"), f);
 
-    /* A write through the alias must be visible through the original name:
-       they are not two files that happen to match, they are the same
-       inode. */
     KT_EQ(t, sfsWriteAt(sfsLookup("alias.txt"), len, " too", 4), 4);
     char back[32];
     memset(back, 0, sizeof(back));
@@ -1245,8 +1060,6 @@ KTEST(sfsHardlinkRejectsDirectoriesAndBadArguments)
     KT_TRUE(t, sfsCreateFile("taken.txt") > 0);
     KT_EQ(t, sfsLink("real.txt", "taken.txt"), -1);
 
-    /* None of the rejected attempts may have left a stray link count or
-       directory entry behind. */
     KT_EQ(t, sfsLinkCountOf(f), 1);
     KT_EQ(t, sfsLookup("alias.txt"), -1);
 }
@@ -1287,13 +1100,12 @@ KTEST(sfsRemoveLastHardlinkFreesInodeAndBlocks)
     KT_LT(t, sfsFreeDataBlocks(), baseline);
 
     KT_TRUE(t, sfsRemove("only.txt"));
-    KT_NE(t, sfsLookup("also.txt"), -1); /* one link left: data still lives */
+    KT_NE(t, sfsLookup("also.txt"), -1);
     KT_TRUE(t, sfsRemove("also.txt"));
     KT_EQ(t, sfsLookup("also.txt"), -1);
 
     KT_EQU(t, sfsFreeDataBlocks(), baseline);
 
-    /* The inode slot must be reusable, not permanently burned. */
     int32 again = sfsCreateFile("only.txt");
     KT_TRUE(t, again > 0);
     KT_EQ(t, sfsSizeOf(again), 0);
@@ -1308,10 +1120,6 @@ KTEST(sfsHardlinkThroughSymlinkTargetsRealInode)
     KT_TRUE(t, f > 0);
     KT_TRUE(t, sfsCreateSymlink("link.txt", "real.txt") > 0);
 
-    /* Linking through a symlink must attach the new name to whatever the
-       symlink resolves to, not to the symlink inode itself (matches
-       link()'s default follow-existingPath semantics, documented on
-       sfsLink). */
     int32 linked = sfsLink("link.txt", "alias.txt");
     KT_EQ(t, linked, f);
     KT_EQ(t, sfsLinkCountOf(f), 2);
@@ -1343,9 +1151,6 @@ KTEST(sfsHardlinkPersistsAcrossUnmountRemount)
     KT_EQ(t, memcmp(back, "persisted", 9), 0);
 }
 
-/* Leave the filesystem in a clean, empty, formatted state for any code that
-   runs after the ktest battery (e.g. a userspace program exercising /mnt
-   through the real syscall path). */
 KTEST(sfsFormatLeavesCleanStateForLaterUse)
 {
     KT_TRUE(t, sfsFormat());

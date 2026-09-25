@@ -29,9 +29,6 @@ static int lookupIntKey(const void* key, const RbtNode* node)
     return 0;
 }
 
-/* Fisher-Yates over a small LCG so insertion/removal order is scrambled but
-   reproducible across runs -- the point is to exercise every rotation case,
-   not to be a real source of randomness. */
 static void shuffle(int32* arr, int32 n, uint32 seed)
 {
     uint32 state = seed;
@@ -44,10 +41,6 @@ static void shuffle(int32* arr, int32 n, uint32 seed)
     }
 }
 
-/* Returns the black-height of node (counting nullptr leaves as height 1) and
-   clears *valid if either red-black rule is broken anywhere in the subtree:
-   a red node with a red child, or unequal black-height between the two
-   sides of some node. */
 static int32 checkSubtree(RbtNode* node, bool* valid)
 {
     if (node == nullptr)
@@ -116,7 +109,6 @@ KTEST(rbtBasicInsertFindOrder)
         KT_EQ(t, rbtEntry(c, IntNode, node)->key, expected[i]);
     KT_EQ(t, i, n);
 
-    /* walking backwards from the max visits the same keys in reverse */
     i = n;
     for (RbtNode* c = rbtLast(&tree); c != nullptr; c = rbtPrev(c))
         KT_EQ(t, rbtEntry(c, IntNode, node)->key, expected[--i]);
@@ -161,7 +153,7 @@ KTEST(rbtSingleRemoveRelinksNeighbors)
         rbtInsert(&tree, &nodes[i].node, compareIntNode);
     }
 
-    rbtRemove(&tree, &nodes[2].node);   /* remove 30, the middle */
+    rbtRemove(&tree, &nodes[2].node);
     KT_EQ(t, rbtCount(&tree), 4);
     KT_TRUE(t, checkInvariants(&tree));
 
@@ -246,7 +238,6 @@ KTEST(rbtStressRemoveMaintainsInvariants)
         rbtInsert(&tree, &pool[key].node, compareIntNode);
     }
 
-    /* remove every even key, in scrambled order */
     int32 removed = 0;
     for (int32 i = 0; i < rbtStressN; i++) {
         int32 key = removeOrder[i];
@@ -279,7 +270,6 @@ KTEST(rbtStressRemoveMaintainsInvariants)
     }
     KT_EQ(t, visited, rbtStressN - removed);
 
-    /* drain the rest, in the same scrambled order, down to nothing */
     for (int32 i = 0; i < rbtStressN; i++) {
         int32 key = removeOrder[i];
         if (key % 2 == 0)

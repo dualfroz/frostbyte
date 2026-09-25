@@ -1,17 +1,6 @@
 #include "ktest.h"
 #include "rtc.h"
 
-/*
- * rtc.c gets two different kinds of coverage here, the same split
- * ata.c/ataTest.c already established: pure arithmetic (the BCD conversion
- * and the civil-date-to-epoch math) is tested with known, hand-verified
- * values that need no hardware at all, while rtcReadDateTime/rtcNow are
- * exercised against whatever CMOS RTC QEMU actually emulates, so a wiring
- * mistake (wrong port, wrong status bit, missed BCD/24-hour branch) shows
- * up as an implausible or non-monotonic reading here, not a mocked
- * assertion.
- */
-
 KTEST(rtcBcdToBinaryKnownValues)
 {
     KT_EQ(t, rtcBcdToBinary(0x00), 0);
@@ -40,10 +29,6 @@ KTEST(rtcEpochSecondsOrdinaryDayIsOneDayApart)
     KT_EQ(t, rtcEpochSeconds(&b) - rtcEpochSeconds(&a), 86400);
 }
 
-/* The single most common bug in hand-rolled calendar math: getting the
-   leap-year rule wrong. 2024 is a leap year (divisible by 4, not by a
-   century that isn't also divisible by 400), so February has 29 days and
-   Feb 28 -> Mar 1 must be a two-day gap, not one. */
 KTEST(rtcEpochSecondsLeapYearFebruaryHas29Days)
 {
     RtcDateTime feb28 = { .year = 2024, .month = 2, .day = 28, .hour = 0, .minute = 0, .second = 0 };
@@ -51,9 +36,6 @@ KTEST(rtcEpochSecondsLeapYearFebruaryHas29Days)
     KT_EQ(t, rtcEpochSeconds(&mar1) - rtcEpochSeconds(&feb28), 2 * 86400);
 }
 
-/* 2023 is not a leap year (not divisible by 4): the same Feb28 -> Mar1
-   comparison must collapse to exactly one day, proving the non-leap branch
-   is not just always adding the leap-year's extra day. */
 KTEST(rtcEpochSecondsNonLeapYearFebruaryHas28Days)
 {
     RtcDateTime feb28 = { .year = 2023, .month = 2, .day = 28, .hour = 0, .minute = 0, .second = 0 };
@@ -61,9 +43,6 @@ KTEST(rtcEpochSecondsNonLeapYearFebruaryHas28Days)
     KT_EQ(t, rtcEpochSeconds(&mar1) - rtcEpochSeconds(&feb28), 86400);
 }
 
-/* A century year is a leap year only when also divisible by 400: 2000 is
-   (400 | 2000), 1900 is not. This is the structural part of the rule the
-   simpler "divisible by 4" tests above cannot distinguish on their own. */
 KTEST(rtcEpochSecondsCenturyLeapRule)
 {
     RtcDateTime feb28_2000 = { .year = 2000, .month = 2, .day = 28, .hour = 0, .minute = 0, .second = 0 };
@@ -99,9 +78,6 @@ KTEST(rtcCivilFromEpochTimeOfDayComponent)
     KT_EQ(t, dt.second, 3);
 }
 
-/* Negative epoch (a date before 1970): -1 second must land on the very
-   last second of 1969, not silently truncate toward 1970-01-01 the way a
-   naive C division (which rounds toward zero) would. */
 KTEST(rtcCivilFromEpochNegativeBeforeEpoch)
 {
     RtcDateTime dt;
@@ -122,10 +98,6 @@ KTEST(rtcCivilFromEpochNegativeBeforeEpoch)
     KT_EQ(t, dt.second, 0);
 }
 
-/* The exact leap-year civil date rtcEpochSecondsLeapYearFebruaryHas29Days
-   above already proves is one apart from March 1st -- rtcCivilFromEpoch
-   must recover 2024-02-29 exactly, not silently normalize it into
-   2024-03-01 (the classic off-by-one a wrong leap rule would produce). */
 KTEST(rtcCivilFromEpochLeapDayRoundTrip)
 {
     RtcDateTime leapDay = { .year = 2024, .month = 2, .day = 29, .hour = 12, .minute = 30, .second = 45 };
@@ -141,11 +113,6 @@ KTEST(rtcCivilFromEpochLeapDayRoundTrip)
     KT_EQ(t, back.second, 45);
 }
 
-/* Round trip through both directions (rtcEpochSeconds then
-   rtcCivilFromEpoch) across a spread of dates spanning several years,
-   month/year boundaries, and a century-leap year -- proves the two
-   functions are genuine inverses of each other over a real range, not
-   just individually correct at a handful of hand-picked points. */
 KTEST(rtcCivilFromEpochRoundTripsAcrossManyDates)
 {
     RtcDateTime samples[] = {
@@ -191,24 +158,14 @@ KTEST(rtcReadDateTimeReturnsPlausibleFields)
 
 KTEST(rtcNowIsNeverNegativeOrObviouslyWrong)
 {
-    /* rtcEpochSecondsUnixEpochIsZero above already proves the math side
-       hits exactly 0 for 1970-01-01; a real read of a QEMU-emulated CMOS
-       clock in 2026 should be nowhere near that, so a driver that
-       accidentally reads all-zero registers (unplugged/uninitialized
-       hardware, a wrong port) is easy to tell apart from a real one here. */
     int64 now = rtcNow();
     KT_GT(t, now, 0);
-    /* 2020-01-01T00:00:00Z, a fixed sanity floor well before this test can
-       ever plausibly run. */
     KT_GT(t, now, 1577836800);
 }
 
 KTEST(rtcNowIsMonotonicAcrossConsecutiveReads)
 {
     int64 first = rtcNow();
-    /* Real port I/O, not a busy-loop the compiler could fold away: two
-       fresh hardware reads a few microseconds apart must never see time
-       run backwards. */
     for (volatile int i = 0; i < 20000; i++) { }
     int64 second = rtcNow();
     KT_GE(t, second, first);

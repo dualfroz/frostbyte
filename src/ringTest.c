@@ -35,14 +35,14 @@ KTEST(ringFillsAndRejects)
     KT_TRUE(t, ringPush(&r, 2));
     KT_TRUE(t, ringPush(&r, 3));
     KT_TRUE(t, ringIsFull(&r));
-    KT_FALSE(t, ringPush(&r, 4));   /* rejected, buffer unchanged */
+    KT_FALSE(t, ringPush(&r, 4));
     KT_EQ(t, ringCount(&r), 3);
 
     uint8 out;
     ringPop(&r, &out);
     KT_EQ(t, out, 1);
     KT_FALSE(t, ringIsFull(&r));
-    KT_TRUE(t, ringPush(&r, 4));    /* room again after the pop */
+    KT_TRUE(t, ringPush(&r, 4));
 }
 
 KTEST(ringWrapsAroundCorrectly)
@@ -51,7 +51,6 @@ KTEST(ringWrapsAroundCorrectly)
     RingBuffer r;
     ringInit(&r, backing, sizeof(backing));
 
-    /* fill, drain two, push two more so the write wraps past the array end */
     ringPush(&r, 1);
     ringPush(&r, 2);
     ringPush(&r, 3);
@@ -86,7 +85,6 @@ KTEST(ringBulkWriteRead)
     KT_EQ(t, written, 5);
     KT_EQ(t, ringCount(&r), 5);
 
-    /* only 3 more bytes fit before capacity 8 is reached */
     const uint8 more[] = { 1, 2, 3, 4 };
     usize written2 = ringWrite(&r, more, sizeof(more));
     KT_EQ(t, written2, 3);

@@ -1,25 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for real, ring-3 NESTED signal delivery (signal.h's
- * per-signal sa_mask / Thread.sigHandlerDepth stack): spawns nesttarget.c,
- * and, through three real happens-before rendezvous pipes (never a sleep
- * guess), sends it sigUsr1, waits for genuine confirmation that sigUsr1's
- * handler has actually entered and blocked, and ONLY THEN sends sigUsr2 --
- * proving sigUsr2 interrupts an ALREADY-ACTIVE handler with a second one of
- * its own, rather than either being dropped, deferred until sigUsr1 returns
- * (which is what an empty-but-still-"one handler at a time" gate, the
- * architecture this replaced, would have done), or racing ahead of sigUsr1
- * even starting.
- *
- * userSigSend's pending-bit write happens synchronously, inside the syscall
- * itself, before it ever returns to this process -- so by the time it
- * returns 0 below, sigUsr2 is unconditionally pending against nesttarget
- * regardless of exactly what nesttarget's own thread is doing at that
- * instant. Only the goFd write that follows needs to be strictly ordered
- * after it, which normal program order on THIS process already guarantees.
- */
-
 int main(void)
 {
     print("nesttest: start, pid=");
@@ -34,9 +14,6 @@ int main(void)
         return 1;
     }
 
-    /* Attach every end THIS process owns before nesttarget even exists --
-       same "attach first" discipline as jobtest.c, so none of these three
-       slots can be reclaimed by a same-instant close on the other side. */
     long readyFd = userPipeAttach(readyHandle, 0);
     long handlerReadyFd = userPipeAttach(handlerReadyHandle, 0);
     long goFd = userPipeAttach(goHandle, 1);
@@ -75,10 +52,6 @@ int main(void)
     print("nesttest: sent sigUsr1 to nesttarget\n");
 
     char handlerReadyByte;
-    /* Real blocking read: does not return until onUsr1 (nesttarget.c) has
-       actually started running AND is about to block on goFd -- the
-       happens-before guarantee that makes the nested-delivery proof below
-       meaningful instead of a coincidence of timing. */
     if (userRead((int)handlerReadyFd, &handlerReadyByte, 1) != 1) {
         print("nesttest: FAIL read handler-ready byte\n");
         return 1;

@@ -19,7 +19,6 @@ KTEST(spinLockAcquireReleaseCycle)
     spinLockRelease(&lock, flags);
     KT_FALSE(t, spinLockIsLocked(&lock));
 
-    /* lock is reusable after release */
     flags = spinLockAcquire(&lock);
     KT_TRUE(t, spinLockIsLocked(&lock));
     spinLockRelease(&lock, flags);
@@ -35,8 +34,6 @@ KTEST(spinLockTryAcquireFailsWhenHeld)
     KT_TRUE(t, spinLockTryAcquire(&lock, &flags));
     KT_TRUE(t, spinLockIsLocked(&lock));
 
-    /* second attempt must not block (and must not touch flags/state) since
-       nothing else on a single core will ever release it for us */
     uint64 otherFlags = 0xDEADBEEF;
     KT_FALSE(t, spinLockTryAcquire(&lock, &otherFlags));
     KT_EQU(t, otherFlags, 0xDEADBEEF);
@@ -45,7 +42,6 @@ KTEST(spinLockTryAcquireFailsWhenHeld)
     spinLockRelease(&lock, flags);
     KT_FALSE(t, spinLockIsLocked(&lock));
 
-    /* now that it is free, tryAcquire succeeds again */
     KT_TRUE(t, spinLockTryAcquire(&lock, &flags));
     spinLockRelease(&lock, flags);
 }

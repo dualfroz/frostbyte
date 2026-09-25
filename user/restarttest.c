@@ -1,17 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for user/restarttarget.c -- see that file's own comment
- * for the full two-phase SA_RESTART/EINTR story. Four real happens-before
- * rendezvous pipes (ready/announce1/announce2/data), never a sleep guess,
- * the same discipline nesttest.c already established for a comparable
- * race: read announce1 before sending the no-restart signal (sigUsr1), then
- * read announce2 -- which restarttarget.c only ever writes AFTER phase 1's
- * read has already come back as errInterrupted and been validated -- before
- * sending the restart-flagged signal (sigUsr2) and writing the real data
- * byte phase 2 expects to receive back.
- */
-
 int main(void)
 {
     print("restarttest: start, pid=");
@@ -61,11 +49,6 @@ int main(void)
     userClose((int)readyFd);
     print("restarttest: restarttarget ready\n");
 
-    /* Real blocking read: does not return until restarttarget has actually
-       written announce1, right before it calls its own victim read -- the
-       happens-before that makes "sigUsr1 lands while genuinely blocked"
-       meaningful rather than a coincidence of timing (same guarantee
-       nesttest.c's handlerReadyFd already gives a different race). */
     if (userRead((int)announce1Fd, &byte, 1) != 1) {
         print("restarttest: FAIL read announce1 byte\n");
         return 1;
@@ -79,9 +62,6 @@ int main(void)
     }
     print("restarttest: sent sigUsr1 (no restart) to restarttarget\n");
 
-    /* restarttarget only ever writes announce2 after phase 1's read has
-       already come back as errInterrupted and been validated, so this read
-       doubles as confirmation phase 1 actually passed. */
     if (userRead((int)announce2Fd, &byte, 1) != 1) {
         print("restarttest: FAIL read announce2 byte\n");
         return 1;

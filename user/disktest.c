@@ -48,12 +48,8 @@ int main(void)
         return 1;
     }
 
-    /* Unaligned write/read spanning a 512-byte sector boundary: byte offset
-       50*512 + 500 leaves 12 bytes in sector 50 and spills 8 bytes into
-       sector 51, exercising the read-modify-write path in vfs.c blockDevRead
-       /blockDevWrite rather than a single aligned sector transfer. */
     const long straddleOffset = 50L * 512 + 500;
-    const char* straddlePayload = "ABCDEFGHIJKLMNOPQRST"; /* 20 bytes */
+    const char* straddlePayload = "ABCDEFGHIJKLMNOPQRST";
     const unsigned long straddleLen = 20;
 
     if (userLseek(fd, straddleOffset, seekSet) != straddleOffset) {
@@ -79,8 +75,6 @@ int main(void)
     }
     print("disktest: straddle round-trip ok\n");
 
-    /* Aligned full-sector write/read at a disjoint offset (sector 55),
-       proving the non-read-modify-write path also works. */
     const long alignedOffset = 55L * 512;
     char alignedOut[512];
     for (int i = 0; i < 512; i++)
@@ -106,8 +100,6 @@ int main(void)
     }
     print("disktest: aligned sector round-trip ok\n");
 
-    /* Overwrite proves the second write actually lands on disk, not just in
-       a stale in-memory copy: reading back must see the newest data. */
     if (userLseek(fd, alignedOffset, seekSet) != alignedOffset)
         return 1;
     char overwrite[512];

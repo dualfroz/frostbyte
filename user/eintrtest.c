@@ -1,22 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for early-wake signal delivery (signal.h/sched.c's
- * threadWakeForSignal): spawns eintrtarget.c, waits for a real
- * happens-before confirmation that it is about to block forever on a read
- * that no writer will ever satisfy (the same unsatisfiable-by-construction
- * setup killtest.c's killvictim.c already established for threadKill), and
- * sends it a real sigTerm through userSigSend -- an ORDINARY signal with
- * its real default disposition (Terminate), not threadKill's direct
- * bypass.
- *
- * If userWait below ever hung the whole boot (see ci-test.sh's 25s QEMU
- * timeout), that would itself BE the regression this proves against: a
- * Blocked thread that never naturally wakes has no other way back to ring 3
- * for isr.c's deliverPendingSignals to ever reach it, without the
- * early-wake this test exists to exercise.
- */
-
 int main(void)
 {
     print("eintrtest: start, pid=");

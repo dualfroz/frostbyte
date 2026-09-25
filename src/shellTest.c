@@ -2,15 +2,6 @@
 #include "shell.h"
 #include "string.h"
 
-/* shellTokenize (shell.c) is the pure-string half of the shell's new
-   `NAME [ARGS] [&]` job-control dispatch (runProgram, shell.c) -- turning
-   a typed line into a real argv[] the way a normal shell does, instead of
-   the single "rest of the line" string every other built-in command is
-   content with. Everything below runs before schedStart() (ktest.h's own
-   file comment), so it deliberately never touches the VFS, jobctl.h, or a
-   real spawn -- only the tokenizer itself, which is ordinary deterministic
-   string manipulation. */
-
 KTEST(shellTokenizeEmptyLine)
 {
     char text[] = "";
@@ -60,10 +51,6 @@ KTEST(shellTokenizeRespectsCapacityInsteadOfOverrunningArray)
 
 KTEST(shellTokenizeTrailingAmpersandIsJustAnotherToken)
 {
-    /* runProgram (shell.c) is the one that gives "&" its background
-       meaning by inspecting the LAST token itself -- shellTokenize's own
-       job is only to split words apart, so it must hand "&" back
-       unchanged like any other token, not special-case it. */
     char text[] = "sleepjob arg1 &";
     char* tokens[8];
     int count = shellTokenize(text, tokens, 8);
@@ -80,13 +67,6 @@ KTEST(shellTokenizeZeroCapacityYieldsNothing)
     int count = shellTokenize(text, tokens, 0);
     KT_EQ(t, count, 0);
 }
-
-/* shellSplitPipelineStages (shell.c) is the pure-string half of the shell's
-   `cmd1 | cmd2 | ... | cmdN` pipeline syntax -- deciding whether execute()
-   should run runPipelineStages (N spawned processes joined by N-1 real
-   pipes) or fall back to a single command, exactly the same "pure logic, no
-   VFS/scheduler" split shellTokenize already has from its own doc comment
-   above. */
 
 KTEST(shellSplitPipelineStagesNoPipeReturnsZero)
 {
@@ -119,9 +99,6 @@ KTEST(shellSplitPipelineStagesTrimsSpacesAroundEachPipe)
 
 KTEST(shellSplitPipelineStagesThreeStageSplitIsRealNotJustFirstPipe)
 {
-    /* Unlike the old two-way shellSplitPipeline this generalizes, every
-       top-level '|' is now recognized -- a real N-stage pipeline, not just
-       the first split with the rest left embedded in one text blob. */
     char text[] = "a | b | c";
     char* stages[shellMaxPipelineStages];
     int count = shellSplitPipelineStages(text, stages, shellMaxPipelineStages);
@@ -145,22 +122,10 @@ KTEST(shellSplitPipelineStagesTooManyStagesReturnsNegativeOneWithoutMutating)
 {
     char text[] = "a | b | c | d | e";
     char* stages[shellMaxPipelineStages];
-    /* shellMaxPipelineStages is 4, but this line has 5 stages -- must be
-       rejected outright, leaving `text` completely untouched, exactly the
-       same "malformed, nothing changed" contract shellExtractRedirects'
-       own dangling-operator case already uses. */
     int count = shellSplitPipelineStages(text, stages, shellMaxPipelineStages);
     KT_EQ(t, count, -1);
     KT_STREQ(t, text, "a | b | c | d | e");
 }
-
-/* shellSplitAndOr (shell.c) is the pure-string half of the shell's new
-   `cmd1 && cmd2 || cmd3 ...` conditional-chaining syntax -- deciding
-   whether execute() should short-circuit through several commands' real
-   exit statuses (executeSingle, shell.c) or fall back to a single
-   command-or-pipeline exactly as before, run BEFORE pipeline splitting
-   (`|` binds tighter than `&&`/`||`), the same "pure logic, no
-   VFS/scheduler" split every other parser above already has. */
 
 KTEST(shellSplitAndOrNoOperatorReturnsZero)
 {
@@ -197,10 +162,6 @@ KTEST(shellSplitAndOrBasicOrSplit)
 
 KTEST(shellSplitAndOrMixedChainRecordsEachOperatorIndependently)
 {
-    /* The classic shell if-then-else idiom: "run b only if a succeeded,
-       run c only if the segment that actually ran last (a or b) did NOT
-       succeed" -- proves && and || are tracked as two independently
-       recorded operators, not collapsed into one boolean. */
     char text[] = "a && b || c";
     char* segments[shellMaxAndOrSegments];
     ShellAndOrOp ops[shellMaxAndOrSegments - 1];
@@ -226,11 +187,6 @@ KTEST(shellSplitAndOrTrimsSpacesAroundEachOperator)
 
 KTEST(shellSplitAndOrLeavesSingleTopLevelPipeInsideItsOwnSegment)
 {
-    /* '|' binds tighter than '&&'/'||': a lone pipe character must never be
-       mistaken for half of '||' (which only matches two CONSECUTIVE '|'
-       characters), so "a | b" stays a single, whole segment here -- only
-       execute()'s own later shellSplitPipelineStages call on that segment
-       ever splits it further. */
     char text[] = "a | b && c";
     char* segments[shellMaxAndOrSegments];
     ShellAndOrOp ops[shellMaxAndOrSegments - 1];
@@ -246,21 +202,10 @@ KTEST(shellSplitAndOrTooManySegmentsReturnsNegativeOneWithoutMutating)
     char text[] = "a && b && c && d && e";
     char* segments[shellMaxAndOrSegments];
     ShellAndOrOp ops[shellMaxAndOrSegments - 1];
-    /* shellMaxAndOrSegments is 4, but this line has 5 segments -- must be
-       rejected outright, leaving `text` completely untouched, the same
-       "malformed, nothing changed" contract shellSplitPipelineStages' own
-       analogous limit already uses. */
     int count = shellSplitAndOr(text, segments, ops, shellMaxAndOrSegments);
     KT_EQ(t, count, -1);
     KT_STREQ(t, text, "a && b && c && d && e");
 }
-
-/* shellExtractRedirects (shell.c) is the pure-token half of shell.c's new
-   `cmd [ARGS] [< IN] [> OUT | >> OUT]` file redirection -- exactly the same
-   "pure logic, no VFS/scheduler" split shellTokenize/shellSplitPipelineStages
-   already have from their own doc comments above, operating on
-   shellTokenize's own output shape (an already-split argv) instead of a
-   raw line. */
 
 KTEST(shellExtractRedirectsNoOperatorsLeavesArgvUnchanged)
 {
@@ -325,9 +270,6 @@ KTEST(shellExtractRedirectsInputAndOutputTogetherKeepRealArgs)
 
 KTEST(shellExtractRedirectsOperatorsCanComeBeforeRealArgs)
 {
-    /* A real shell accepts redirection operators anywhere on the line, not
-       only trailing -- "> out.txt cat file.txt" is a weird but legal way
-       to write "cat file.txt > out.txt". */
     char text[] = "> out.txt cat file.txt";
     char* argv[8];
     int argc = shellTokenize(text, argv, 8);
@@ -380,12 +322,6 @@ KTEST(shellExtractRedirectsNoTokensYieldsNoRedirects)
     KT_NULL(t, redirect.inPath);
     KT_NULL(t, redirect.outPath);
 }
-
-/* `2>`/`2>>` (stderr redirection) are a separate operator family from
-   `<`/`>`/`>>` above, targeting fd 2 instead of fd 0/fd 1 -- covered on
-   their own (truncate, append, combined with stdout, last-one-wins,
-   dangling) plus one case proving the two families never interfere with
-   each other even when both appear on the same line. */
 
 KTEST(shellExtractRedirectsErrTruncate)
 {
@@ -464,13 +400,6 @@ KTEST(shellExtractRedirectsDanglingErrOperatorFailsWithoutMutating)
     KT_STREQ(t, argv[2], "2>");
 }
 
-/* `<<<` (here-string) is a third, independent fd-0 operator alongside `<` --
-   covered on its own (basic recognition, combined with real args and `>`,
-   dangling), plus the two last-one-wins cases proving `<` and `<<<` share
-   ownership of the SAME fd 0 (whichever comes later in the line wins,
-   clearing the other field entirely) rather than being two unrelated
-   fields a caller could accidentally read both of at once. */
-
 KTEST(shellExtractRedirectsHereStringBasic)
 {
     char text[] = "cat <<< hello";
@@ -541,11 +470,6 @@ KTEST(shellExtractRedirectsFileRedirectAfterHereStringWins)
     KT_NULL(t, redirect.hereString);
 }
 
-/* shellParseVarRef (shell.c) is the pure-syntax half of the shell's new
-   `$NAME` unquoted parameter expansion -- recognizing the "$" + name-chars
-   shape, never touching sched.h's Thread.env (that lookup is
-   shellExpandArgv's job, not KTEST-able here for the same pre-scheduler
-   reason shellTokenize's own file comment gives). */
 KTEST(shellParseVarRefAcceptsPlainName)
 {
     char name[16];
@@ -587,21 +511,12 @@ KTEST(shellParseVarRefRejectsNameTooLongForCapacity)
     KT_FALSE(t, shellParseVarRef("$TOOLONG", name, sizeof(name)));
 }
 
-/* shellParseVarRef must never accept `$?` itself -- '?' is not in its own
-   [A-Za-z0-9_] name-character set -- so the two token classes
-   (shellIsStatusVarToken below and shellParseVarRef above) can never
-   both claim the same token. */
 KTEST(shellParseVarRefRejectsQuestionMark)
 {
     char name[16];
     KT_FALSE(t, shellParseVarRef("$?", name, sizeof(name)));
 }
 
-/* shellIsStatusVarToken (shell.c) is the pure-syntax half of the shell's
-   new `$?` special parameter -- recognizing the EXACT two-character token
-   "$?", never touching this file's own file-scope `lastStatus` (that
-   substitution is shellExpandToken's job, not KTEST-able here for the
-   same pre-scheduler reason shellExpandArgv's own env lookups are not). */
 KTEST(shellIsStatusVarTokenAcceptsExactMatch)
 {
     KT_TRUE(t, shellIsStatusVarToken("$?"));
@@ -626,14 +541,6 @@ KTEST(shellIsStatusVarTokenRejectsLeadingGarbage)
 {
     KT_FALSE(t, shellIsStatusVarToken("x$?"));
 }
-
-/* shellGlobMatch/shellTokenHasGlob/shellSplitGlobToken (shell.c) are the
-   pure-logic half of the shell's new wildcard glob expansion
-   (shellExpandGlobs, which actually walks the VFS and is not KTEST-able
-   here for the same pre-scheduler reason shellExpandArgv's own VFS/thread
-   lookups are not) -- the same "pure logic here, thread/VFS-touching glue
-   stays static in shell.c" split every other pure function above already
-   follows. */
 
 KTEST(shellGlobMatchExactLiteral)
 {
@@ -717,23 +624,12 @@ KTEST(shellSplitGlobTokenSplitsAtLastSlashIncludingIt)
 
 KTEST(shellSplitGlobTokenNoGlobCharStillSplitsCleanly)
 {
-    /* shellSplitGlobToken itself does not care whether the pattern half
-       actually contains a glob character -- that gate is
-       shellTokenHasGlob's own job, called first by shellExpandGlobs. */
     char dir[64];
     char pattern[64];
     shellSplitGlobToken("/tmp/gd/plain.txt", dir, sizeof(dir), pattern, sizeof(pattern));
     KT_STREQ(t, dir, "/tmp/gd/");
     KT_STREQ(t, pattern, "plain.txt");
 }
-
-/* shellFindCommandSubst (shell.c) is the pure-syntax half of the shell's
-   new `$(cmd [args])` command-substitution expansion -- the impure glue
-   that actually spawns and captures a command's output (shellExpandCommandSubst,
-   static in shell.c) needs a real jobctl spawn, off limits for KTEST's
-   pre-scheduler context, so only the locate-and-extract half is covered
-   here, the same "pure logic here, thread/VFS-touching glue stays static
-   in shell.c" split every other shell.h syntax function already gets. */
 
 KTEST(shellFindCommandSubstNoDollarParenReturnsNotFound)
 {
@@ -798,11 +694,6 @@ KTEST(shellFindCommandSubstTruncatesToCapacity)
 
 KTEST(shellFindCommandSubstOnlyMatchesFirstOccurrence)
 {
-    /* No nested-paren support (documented in shell.h) -- the very NEXT ')'
-       after the opening '$(' ends the match, so a second, unrelated
-       `$(...)` later in the line is left completely untouched for a
-       caller's own repeat scan (shellExpandCommandSubst's own loop) to
-       find on a later pass, never folded into this one's own cmdOut. */
     int start, end;
     char cmd[32];
     KT_TRUE(t, shellFindCommandSubst("$(a) $(b)", &start, &end, cmd, sizeof(cmd)));

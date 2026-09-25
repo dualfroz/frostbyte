@@ -1,15 +1,6 @@
 #include "ulib.h"
 #include "fs.h"
 
-/*
- * Exercises the persistent SFS filesystem (sfs.h/sfs.c) through the exact
- * same syscall path a real userspace program would use: open/write/read/
- * close/mkdir/getdents/unlink on paths under "/mnt", which vfs.c dispatches
- * to sfs.c instead of the kmalloc-based tmpfs tree. Proves the full stack
- * (syscall -> vfs -> sfs -> real block I/O on the same ATA disk /dev/disk0
- * uses) works end to end, not just the in-kernel sfs.c unit tests.
- */
-
 static int bytesEqual(const char* a, const char* b, unsigned long n)
 {
     for (unsigned long i = 0; i < n; i++)
@@ -24,7 +15,6 @@ int main(void)
     printDec(userGetpid());
     print("\n");
 
-    /* Nested directory creation. */
     if (userMkdir("/mnt/app") != 0) {
         print("fstest: FAIL mkdir /mnt/app\n");
         return 1;
@@ -34,8 +24,6 @@ int main(void)
         return 1;
     }
 
-    /* Create + write + close, then reopen with a fresh fd to prove the data
-       lives past the writer's own fd, not just in that fd's local state. */
     const char* payload = "frostbyte fstest payload line one\n";
     unsigned long payloadLen = stringLength(payload);
 
@@ -70,8 +58,6 @@ int main(void)
     userClose(rfd);
     print("fstest: create/write/reopen/read round-trip ok\n");
 
-    /* Append across two separate open() calls: growth must pick up where
-       the previous session's data ended. */
     int afd = (int)userOpen("/mnt/app/logs/boot.log", oReadWrite | oAppend);
     if (afd < 0) {
         print("fstest: FAIL open for append\n");
@@ -91,8 +77,6 @@ int main(void)
     }
     print("fstest: append across reopen ok\n");
 
-    /* A second, unrelated file in the same directory, to exercise readdir
-       against more than one entry. */
     int cfd = (int)userOpen("/mnt/app/logs/counters.txt", oReadWrite | oCreate);
     if (cfd < 0) {
         print("fstest: FAIL create second file\n");
@@ -130,7 +114,6 @@ int main(void)
     }
     print("fstest: readdir lists both files ok\n");
 
-    /* Unlink one, verify it is gone and its sibling survives. */
     if (userUnlink("/mnt/app/logs/counters.txt") != 0) {
         print("fstest: FAIL unlink counters.txt\n");
         return 1;

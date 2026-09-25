@@ -3,36 +3,6 @@
 
 #include "types.h"
 
-/*
- * In-kernel self-test harness (KUnit-style).
- *
- * A test is written as:
- *
- *     #include "ktest.h"
- *
- *     KTEST(mySubsystemBasics)
- *     {
- *         KT_EQ(t, 2 + 2, 4);
- *         KT_TRUE(t, somePredicate());
- *     }
- *
- * The KTEST macro both declares the test body and registers a pointer to it
- * into the ".ktests" linker section, so no shared registry file has to be
- * edited when a new test is added.  ktestRunAll() (called once from kmain
- * before the scheduler starts) iterates the section, runs every test, prints
- * per-test results and a final machine-readable line:
- *
- *     KTEST SUMMARY: <tests> tests, <checks> checks, <failures> failed
- *
- * The boot gate (tools/ci-test.sh) requires that line to report 0 failures,
- * so a broken subsystem makes the gate fail instead of silently passing.
- *
- * Tests run with interrupts disabled, before the scheduler starts.  They must
- * be deterministic and must NOT depend on timer ticks, preemption or user
- * threads.  They may use kmalloc/kfree, the string helpers, pmm and any
- * subsystem they explicitly initialise themselves.
- */
-
 typedef struct KtestCtx {
     const char* name;
     uint64 checks;
@@ -46,16 +16,10 @@ typedef struct KtestEntry {
     KtestFn fn;
 } KtestEntry;
 
-/* Runs every registered test, prints results, returns the number of failed
-   checks across all tests (0 means the whole battery is green). */
 uint64 ktestRunAll(void);
 
-/* Records one check.  On failure it prints "FAIL file:line  expr" and marks
-   the current test context as failed.  Returns the boolean result so callers
-   can branch (e.g. skip a dereference after a null check failed). */
 bool ktestCheck(KtestCtx* t, bool ok, const char* expr, const char* file, int line);
 
-/* Null-safe string comparison used by KT_STREQ. */
 bool ktestStrEq(const char* a, const char* b);
 
 #define KTEST(testName)                                                          \

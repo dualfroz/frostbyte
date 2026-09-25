@@ -1,18 +1,6 @@
 #include "ulib.h"
 #include "fs.h"
 
-/*
- * Exercises SFS's new real wall-clock inode timestamps (sfs.h's
- * sfsMtimeOf/sfsCtimeOf) through the exact same syscall path a real
- * userspace program would use (userOpen/userWrite/userStat/userLink on
- * "/mnt", like fstest.c/linktest.c already do for size/content), proving the
- * full stack -- syscall -> vfs -> sfs -> the on-disk inode's mtime/ctime
- * fields, stamped from the real CMOS RTC (rtc.c) -- works end to end, not
- * just the in-kernel sfs.c unit tests. Fully synchronous like nicetest.c/
- * date.c: no injected keystrokes, no shared shell channel, so there is no
- * scheduling-timing race to flake on regardless of host load.
- */
-
 int main(void)
 {
     print("timetest: start, pid=");

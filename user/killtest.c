@@ -1,15 +1,5 @@
 #include "ulib.h"
 
-/*
- * Exercises threadKill (sched.c) end to end through sysKill: spawns
- * killvictim.c (which blocks forever in a real, syscall-level pipe read
- * with no writer ever attaching), waits long enough for it to actually
- * reach and park inside that read, then kills it and confirms userWait
- * reports exactly the killed exit status (9) -- the only way this kernel
- * can ever recover a process stuck in a genuine block, now that
- * sysRead/sysWrite can really block (pipe.h/vfs.h, same wave as this).
- */
-
 int main(void)
 {
     print("killtest: start, pid=");
@@ -28,18 +18,32 @@ int main(void)
     }
     print("killtest: kill bad pid rejected\n");
 
-    long victim = userSpawn("/bin/killvictim", 0);
+    long readyHandle = userPipeCreate();
+    if (readyHandle < 0) {
+        print("killtest: FAIL create ready pipe\n");
+        return 1;
+    }
+    long readyFd = userPipeAttach(readyHandle, 0);
+    if (readyFd < 0) {
+        print("killtest: FAIL attach ready pipe\n");
+        return 1;
+    }
+
+    char readyHandleStr[24];
+    decToString(readyHandle, readyHandleStr);
+    char* victimArgv[] = { "/bin/killvictim", readyHandleStr, 0 };
+    long victim = userSpawn("/bin/killvictim", victimArgv);
     if (victim < 0) {
         print("killtest: FAIL spawn killvictim\n");
         return 1;
     }
 
-    /* Give the victim time to actually attach and reach its blocking read
-       -- killing it before it ever calls userRead would still "work" (any
-       Runnable/Sleeping/Blocked thread is a valid target), but would not
-       prove the interesting case: tearing down a call already parked
-       mid-syscall. */
-    userSleep(100);
+    char readyByte;
+    if (userRead((int)readyFd, &readyByte, 1) != 1) {
+        print("killtest: FAIL read ready byte\n");
+        return 1;
+    }
+    userClose((int)readyFd);
 
     if (userKill(victim) != 0) {
         print("killtest: FAIL kill victim\n");
@@ -56,8 +60,6 @@ int main(void)
         return 1;
     }
 
-    /* Already dead and reaped (userWait above reaped it): killing it again
-       must fail cleanly, not resurrect a slot that has since been reused. */
     if (userKill(victim) != -1) {
         print("killtest: FAIL kill of already-reaped pid should fail\n");
         return 1;

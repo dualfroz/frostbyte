@@ -1,26 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for real, ring-3 sa_mask DEFERRAL of signal delivery
- * (signal.h's per-signal sa_mask / Thread.sigHandlerMasks): spawns
- * masktarget.c, and, through three real happens-before rendezvous pipes
- * (never a sleep guess, the same discipline nesttest.c already
- * established), sends it sigUsr1, waits for genuine confirmation that
- * sigUsr1's handler has actually entered and masked sigUsr2, and ONLY THEN
- * sends sigUsr2 -- proving sigUsr2 does NOT interrupt the already-active
- * handler the way nesttest.c's own sigUsr2 deliberately does, but instead
- * waits until sigUsr1's handler genuinely returns before ever running.
- *
- * userSigSend's pending-bit write happens synchronously, inside the syscall
- * itself, before it ever returns to this process -- so by the time it
- * returns 0 below, sigUsr2 is unconditionally pending against masktarget
- * regardless of exactly what masktarget's own thread is doing at that
- * instant. Only the goFd write that follows needs to be strictly ordered
- * after it, which normal program order on THIS process already guarantees
- * -- the same reasoning nesttest.c's own comment already gives for its
- * mirror-image scenario.
- */
-
 int main(void)
 {
     print("masktest: start, pid=");
@@ -35,10 +14,6 @@ int main(void)
         return 1;
     }
 
-    /* Attach every end THIS process owns before masktarget even exists --
-       same "attach first" discipline as jobtest.c/nesttest.c, so none of
-       these three slots can be reclaimed by a same-instant close on the
-       other side. */
     long readyFd = userPipeAttach(readyHandle, 0);
     long handlerReadyFd = userPipeAttach(handlerReadyHandle, 0);
     long goFd = userPipeAttach(goHandle, 1);
@@ -77,11 +52,6 @@ int main(void)
     print("masktest: sent sigUsr1 to masktarget\n");
 
     char handlerReadyByte;
-    /* Real blocking read: does not return until onUsr1 (masktarget.c) has
-       actually started running, installed its sa_mask's grip on sigUsr2,
-       AND is about to block on goFd -- the happens-before guarantee that
-       makes the deferral proof below meaningful instead of a coincidence
-       of timing. */
     if (userRead((int)handlerReadyFd, &handlerReadyByte, 1) != 1) {
         print("masktest: FAIL read handler-ready byte\n");
         return 1;

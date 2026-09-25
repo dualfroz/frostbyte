@@ -1,33 +1,5 @@
 #include "ulib.h"
 
-/*
- * Boot-time driver for the new SIGCHLD-on-stop/SIGCHLD-on-continue
- * notification (sched.c's threadStop/threadContinue, mirroring
- * threadExit/threadKill's existing sigChld-on-death contract): proves the
- * kernel itself notifies a process's parent, asynchronously, both when a
- * child it spawned actually stops AND when it later resumes -- not only
- * when it eventually dies (user/sigchldtest.c already covers death;
- * user/jobtest.c already covers stop/continue genuinely working against a
- * thread blocked mid-syscall, but installs no sigChld handler at all).
- * This is the first live demo combining both: a real installed handler
- * (sigchldtest.c's shape) watching a target genuinely Blocked in its own
- * syscall (jobtest.c's shape) across THREE distinct lifecycle events in a
- * single run.
- *
- * sigChld's pending bit (signal.c) is a single flag, not a queue -- two
- * raises before the handler ever runs would coalesce into one delivery.
- * This is why each stage below waits (the same bounded "check a counter
- * every userSleep(20)" poll idiom sigchldtest.c/masktarget.c/nesttarget.c
- * already use) for its own handler firing to be OBSERVED before triggering
- * the next event: stop, confirm, write+cont, confirm, wait, confirm --
- * proving all three notifications actually land distinctly rather than
- * silently collapsing into fewer than three.
- *
- * Two independent pipes (ready, go), attached before spawning, for the
- * same "attach first" race-avoidance reason user/jobtest.c's own file
- * comment documents at length.
- */
-
 static volatile int chldSigCount = 0;
 
 static void onChld(int signum)
@@ -36,11 +8,6 @@ static void onChld(int signum)
     chldSigCount++;
 }
 
-/* Bounded poll for chldSigCount reaching `want`, exactly the idiom
-   user/sigchldtest.c's own file comment explains: whether the kernel event
-   already happened or is about to, the next natural sleep-wake cycle's
-   return to ring 3 re-checks pending signals unconditionally (isr.c's
-   deliverPendingSignals), so this never has to guess timing. */
 static int waitForChldSigCount(int want)
 {
     for (int i = 0; i < 80 && chldSigCount < want; i++)
@@ -105,9 +72,6 @@ int main(void)
     }
     print("stopchldtest: sigchld-on-stop-ok\n");
 
-    /* Same "write while stopped" proof as jobtest.c: the byte the target is
-       blocked on queues up behind a genuinely Stopped thread without being
-       lost or delivered early. */
     if (userWrite((int)goFd, "g", 1) != 1) {
         print("stopchldtest: FAIL write go byte\n");
         return 1;
@@ -126,23 +90,6 @@ int main(void)
     }
     print("stopchldtest: sigchld-on-continue-ok\n");
 
-    /* onChld is installed WITHOUT sigFlagRestart (see above), so this
-       userWait is itself one of the three retryable syscalls sigConsumePending
-       (signal.c) can hijack: if stopchldtarget's own death (and the sigChld
-       it raises against US, the exact signal this handler is for) happens
-       WHILE this thread is genuinely parked mid userWait's retry-on-block
-       pattern, delivery does not politely wait its turn behind the retry --
-       it REWRITES the interrupted context to return errInterrupted right
-       then, exactly like restarttarget.c's own phase 1 proves for an
-       unrelated signal/syscall pair, and the retry that would have found
-       the now-dead child never gets to run at all. A real, correctly
-       written POSIX program with a non-restarting SIGCHLD handler has this
-       exact same hazard against its own wait()/waitpid() and handles it the
-       same way: loop past EINTR. Only the FAST path (target already Dead
-       by the time this syscall's body first runs, no parking needed at
-       all) returns 66 on the first try; whichever way it goes, the retry
-       (if one was needed) always finds the child already reaped-or-dead,
-       so this never loops more than twice in practice. */
     long status;
     for (;;) {
         status = userWait(target);
@@ -157,17 +104,6 @@ int main(void)
         return 1;
     }
 
-    /* Whether userWait above needed one retry or returned 66 immediately,
-       onChld has by now fired exactly a third time: either it ran AS the
-       interruption above (incrementing the count before rewriting status
-       to errInterrupted, so the retry's own later success finds it already
-       at 3), or it ran as a genuine nested delivery riding the same
-       successful return home (the fast-path case) -- sigChld's pending bit
-       is a single flag either way, so exactly one of those two shapes
-       happens per death, never both, never neither. This checks the count
-       is EXACTLY 3, not just at least 3, proving stop+continue+exit
-       produced three distinct notifications rather than two of them
-       silently coalescing into one pending bit somewhere along the way. */
     if (chldSigCount != 3) {
         print("stopchldtest: FAIL expected exactly 3 sigchld deliveries, got ");
         printDec(chldSigCount);

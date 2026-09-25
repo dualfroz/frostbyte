@@ -1,18 +1,6 @@
 #include "ulib.h"
 #include "fs.h"
 
-/*
- * Exercises the symlink/readlink/link syscalls (sysSymlink/sysReadlink/
- * sysLink -> vfs.c -> sfs.c, sfs.h already had the on-disk machinery from an
- * earlier wave; this wave wires it up to ring 3) against the persistent SFS
- * filesystem under "/mnt". Kernel-side symlink target strings are resolved
- * relative to the SFS root (sfs.h), not to "/mnt" -- so a symlink created
- * from userspace at "/mnt/linktest/link.txt" pointing at
- * "/mnt/linktest/real.txt" must store the target as "/linktest/real.txt"
- * (the "/mnt" prefix stripped, exactly what vfsSymlink hands to
- * sfsCreateSymlink) for later resolution to actually find it.
- */
-
 static int bytesEqual(const char* a, const char* b, unsigned long n)
 {
     for (unsigned long i = 0; i < n; i++)
@@ -46,8 +34,6 @@ int main(void)
     }
     userClose(wfd);
 
-    /* Symlink resolution through open()/read(): opening the link must
-       transparently reach real.txt's data. */
     if (userSymlink("/linktest/real.txt", "/mnt/linktest/link.txt") != 0) {
         print("linktest: FAIL symlink create\n");
         return 1;
@@ -67,7 +53,6 @@ int main(void)
     }
     print("linktest: open/read transparently follows symlink ok\n");
 
-    /* stat() must also follow: size should match the target, not 0. */
     FbStat st;
     if (userStat("/mnt/linktest/link.txt", &st) != 0 || st.size != payloadLen) {
         print("linktest: FAIL stat through symlink\n");
@@ -75,8 +60,6 @@ int main(void)
     }
     print("linktest: stat follows symlink ok\n");
 
-    /* readlink() must NOT follow -- it reports the link's own target
-       string, not the target's contents. */
     char targetBuf[64];
     long targetLen = userReadlink("/mnt/linktest/link.txt", targetBuf, sizeof(targetBuf));
     const char* expectedTarget = "/linktest/real.txt";
@@ -88,14 +71,12 @@ int main(void)
     }
     print("linktest: readlink reports target string ok\n");
 
-    /* readlink on a non-symlink must fail, not read garbage. */
     if (userReadlink("/mnt/linktest/real.txt", targetBuf, sizeof(targetBuf)) >= 0) {
         print("linktest: FAIL readlink on non-symlink should fail\n");
         return 1;
     }
     print("linktest: readlink rejects non-symlink ok\n");
 
-    /* Hardlink: alias.txt shares real.txt's inode and data. */
     if (userLink("/mnt/linktest/real.txt", "/mnt/linktest/alias.txt") != 0) {
         print("linktest: FAIL hardlink create\n");
         return 1;
@@ -113,15 +94,12 @@ int main(void)
     }
     print("linktest: hardlink shares data ok\n");
 
-    /* Directories cannot be hardlinked. */
     if (userLink("/mnt/linktest", "/mnt/linktest2") == 0) {
         print("linktest: FAIL hardlinking a directory should be rejected\n");
         return 1;
     }
     print("linktest: hardlink rejects directory ok\n");
 
-    /* Removing the original must leave the hardlinked alias alive (link
-       count keeps the inode+data around). */
     if (userUnlink("/mnt/linktest/real.txt") != 0) {
         print("linktest: FAIL unlink real.txt\n");
         return 1;
@@ -139,8 +117,6 @@ int main(void)
     }
     print("linktest: alias survives unlink of original ok\n");
 
-    /* Dangling symlink: creation succeeds (target is never validated), open
-       through it must fail cleanly instead of crashing. */
     if (userSymlink("/linktest/does-not-exist.txt", "/mnt/linktest/dangling.txt") != 0) {
         print("linktest: FAIL dangling symlink create\n");
         return 1;
