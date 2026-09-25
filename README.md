@@ -1,209 +1,341 @@
 # frostbyte
 
-A small hobby operating system kernel for x86_64, written in C and GAS assembly.
-It boots via Multiboot2/GRUB, switches from 32-bit protected mode into 64-bit long
-mode with its own page tables, runs a preemptive round-robin scheduler, and loads
-static ELF programs from a ramdisk into ring 3 that talk back through system calls.
+frostbyte is a hobby x86_64 kernel written in freestanding C and GNU assembler. GRUB
+loads it as a Multiboot2 kernel; it switches itself into 64-bit long mode, runs in
+the higher half, schedules kernel threads and ring-3 processes with a weighted
+fair scheduler, and loads static ELF programs from a USTAR ramdisk. Processes talk
+to the kernel through 56 system calls covering files, pipes and FIFOs, process
+spawning and exec, POSIX-style signals, job control, `poll`, `mmap`, pidfds and a
+Unix permission model. Storage comes from a ramdisk, an in-memory tmpfs and a
+persistent inode filesystem on an ATA disk. An in-kernel shell supports pipelines,
+redirection, background jobs and environment variables. Every boot runs an
+in-kernel test suite and a set of ring-3 test programs, and a headless QEMU script
+checks their output.
 
-Everything below is verifiable headlessly in QEMU.
+## Features
 
-## What it does
+### Boot
 
-- Boots as a Multiboot2 kernel loaded by GRUB at 1 MiB, then builds its own paging
-  structures and jumps into a higher-half 64-bit kernel at `0xFFFFFFFF80000000`.
-- Talks over serial COM1 and the VGA text buffer through a shared `kprintf`.
-- Installs a full IDT (32 CPU exception handlers, 16 remapped hardware IRQs, and a
-  ring-3-callable `int 0x80` syscall gate).
-- Drives the PIT at 100 Hz and preempts between kernel and user threads on every tick.
-- Reads the PS/2 keyboard and feeds an in-kernel shell.
-- Manages physical RAM with a bitmap frame allocator built from the Multiboot2
-  memory map, maps pages on demand, and serves a real free-list heap with `kfree`
-  and coalescing.
-- Loads a Multiboot2 module ramdisk in USTAR (tar) format, parses static x86_64 ELF
-  executables from it, maps their segments as user pages, and runs them in ring 3
-  with their own kernel and user stacks via a TSS.
-- Mounts a VFS: the USTAR ramdisk read-only at `/` (directories and files) and a
-  writable in-RAM tmpfs at `/tmp`, with per-process file descriptor tables.
-- Serves system calls: `write`, `read`, `exit`, `getpid`, `yield`, `sbrk`, `sleep`,
-  plus `open`, `close`, `lseek`, `stat`, `getdents`, `mkdir`, `unlink`.
+- Multiboot2 header and 32-bit entry point (`src/boot.S`). The entry code checks
+  for long mode, maps the first 1 GiB with 2 MiB pages both identity-mapped and at
+  `0xFFFFFFFF80000000`, turns on PAE, `EFER.LME` and paging, and jumps into the
+  64-bit higher-half kernel. When CPUID reports NX, `EFER.NXE` is enabled too.
+- `kmain` sets up the GDT (kernel and user segments plus a 64-bit TSS), the IDT
+  (32 exception vectors, 16 remapped IRQs, an `int 0x80` gate callable from
+  ring 3), the 8259 PIC, the PIT at 100 Hz and the PS/2 keyboard. It then finds the
+  ramdisk module, mounts the filesystems, runs the self-tests, starts the boot
+  demo threads and user programs, and enables preemption.
 
-## Layout
+### Memory
+
+- Bitmap physical frame allocator built from the Multiboot2 memory map
+  (`pmm.c`).
+- 4-level paging with page tables allocated on demand, user-range mapping and
+  unmapping, address resolution and NX support (`paging.c`). ELF segments are
+  mapped W^X based on their `p_flags`.
+- 48 MiB kernel heap: a free-list allocator with `kmalloc`, `kfree`, `krealloc`
+  and coalescing of neighbouring free blocks (`heap.c`).
+- Frame-backed slab caches for fixed-size objects (`slab.c`).
+- One address space shared by the whole system. Each user binary is linked at its
+  own 256 MiB slot: code and data at the base, `sbrk` heap from +64 MiB, the stack
+  ending at +128 MiB, and an `mmap` area from +128 MiB to the end of the slot.
+  When a process is reaped, its whole slot is unmapped and the frames are freed.
+- `mmap`/`munmap`: anonymous or file-backed mappings with read, write and exec
+  protection. Pages are filled lazily from the page fault handler, and an access
+  that breaks the protection delivers `SIGSEGV`.
+
+### Scheduler and processes
+
+- Preemptive scheduler driven by the 100 Hz timer (`sched.c`). Each runnable
+  thread has a virtual runtime that grows in inverse proportion to its weight. The
+  thread with the smallest virtual runtime runs next, taken from a priority queue
+  built on an intrusive red-black tree (`prioq.c`, `rbt.c`). New and newly woken
+  threads start no lower than the current minimum, so they cannot starve threads
+  that have already run.
+- Kernel threads and ring-3 processes share one thread table (288 slots).
+  Free slots are reused round-robin, and every slot carries a generation counter.
+  A process has its own kernel stack, file descriptor table (16 entries), working
+  directory, environment (8 variables), uid/gid, process group and signal state.
+- There is no `fork`. `spawn` loads a binary into a new process (like
+  `posix_spawn`) and `exec` replaces the caller's image in place, keeping its pid
+  and open descriptors. Both pass `argv` on the new stack using the SysV layout.
+- `wait` for one pid or for any child, `kill` for a pid or a process group,
+  sleeping, blocking on wait channels, and `nice`/`getpriority` to change the
+  scheduling weight.
+- pidfds (`pidfd.c`): a handle tied to one particular process. Once that process
+  is reaped, the pidfd reports it as gone, even if a new process has been given
+  the same pid.
+
+### Signals and job control
+
+- 32 signals with default actions (terminate, ignore, stop, continue) and user
+  handlers that run through a shared trampoline page and return with `sigreturn`
+  (`signal.c`, `sigTrampoline.S`).
+- Per-process signal masks (block, unblock, set) and per-handler masks. Handler
+  flags `sigFlagRestart` (restart the interrupted system call instead of failing
+  with EINTR), `sigFlagNoDefer` and `sigFlagSigInfo` (pass a siginfo record with
+  the sender pid and code). Nested delivery is supported.
+- `SIGCHLD` is sent when a child exits, is killed, stops or continues.
+  `SIGSTOP`/`SIGCONT` work, and `alarm` delivers `SIGALRM`. A process ended by a
+  signal exits with code 128 + signal number.
+- Process groups and a foreground group. The keyboard driver sends Ctrl-C as
+  `SIGINT` and Ctrl-Z as `SIGTSTP` to the foreground group only.
+
+### Filesystems
+
+- VFS (`vfs.c`) with paths relative to the working directory and per-process
+  file descriptors. Mounts:
+  - `/`: the USTAR ramdisk (read-only), loaded as a Multiboot2 module.
+  - `/tmp`: a writable tmpfs held in kernel memory.
+  - `/mnt`: SFS, a persistent inode filesystem on the ATA disk (`sfs.c`). It has
+    a superblock, inode and block bitmaps, 512 inodes, and direct plus single,
+    double and triple indirect blocks. Inodes store the size, link count, mode,
+    uid, gid, mtime and ctime. An unformatted disk is formatted on mount.
+  - `/dev/disk0`: the raw ATA disk as a seekable byte device.
+- Files, directories, `unlink`, `rmdir`, `getdents`, `stat`, `lseek`, append
+  and truncate. Symbolic links (followed for up to 8 hops) and hard links are
+  available on `/mnt`.
+- Unix permissions: owner/group/other rwx bits, checked on open, exec, directory
+  search, directory listing and directory writes. `chmod`, `chown` and `chgrp`
+  follow owner and root rules, and a process can drop root with
+  `setuid`/`setgid`.
+- Timestamps come from the CMOS real-time clock.
+
+### Pipes, FIFOs and poll
+
+- Anonymous pipes (`pipe`), plus pipes created by handle that any number of
+  processes can attach to as readers or writers (`pipeCreate`/`pipeAttach`).
+- Named FIFOs (`mkfifo`) on tmpfs and on SFS. Opening a FIFO for writing blocks
+  until a reader is present.
+- Blocking reads and writes, EOF once the last writer closes, and a write error
+  once the last reader closes. Each pipe has a 256-byte buffer, and 32 pipes can
+  exist at once.
+- `poll` over pipes and the console, with an optional timeout.
+
+### Drivers
+
+- Serial COM1 and the 80x25 VGA text console. Both are written by one
+  interrupt-safe `kprintf`.
+- PS/2 keyboard (scancode set 1, Shift and left Ctrl). Several processes can read the
+  console at once and each one gets every key.
+- PIT timer, 8259 PIC, CMOS RTC.
+- ATA PIO: primary master, LBA28, polling with bounded timeouts.
+
+### Kernel library
+
+Freestanding `string`/`klib` routines (`snprintf`, `strtol`, `qsort`, `bsearch`,
+`strTokR` and more), an intrusive doubly linked list, a ring buffer, a red-black
+tree and a priority queue. The kernel itself uses all of these. The repository
+also has a growable vector, an FNV-1a hash map, a bitmap and an interrupt-safe
+spinlock; for now only the self-tests use those.
+
+### Shell
+
+`src/shell.c` runs as a kernel thread. It reads input from the PS/2 keyboard and
+writes to VGA and serial.
+
+- Built-in commands: `help`, `echo`, `ls [-l]`, `cat`, `mkdir`, `rm`, `rmdir`,
+  `chmod`, `chown`, `chgrp`, `cd`, `pwd`, `whoami`, `mem`, `uptime`, `ps`,
+  `jobs`, `export`, `unset`, `env`, `clear`.
+- Any other word runs `/bin/NAME` in a new process group, in the foreground or in
+  the background with `&`.
+- Pipelines (`a | b | c`), redirections (`<`, `>`, `>>`, `2>`, `2>>`),
+  here-strings (`<<<`), `&&` and `||` chains, `$NAME` and `$?` expansion, and
+  `*` globs.
+
+## System calls
+
+User programs make system calls with `int 0x80`. The call number goes in `rax`
+and the arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`. Numbers are defined
+in `include/syscall.h`, and the wrappers in `user/ulib.c`.
+
+| No. | Name | Purpose |
+|---|---|---|
+| 0 | exit | end the calling process with an exit code |
+| 1 | write | write to a file descriptor |
+| 2 | read | read from a file descriptor (blocks on pipes and the console) |
+| 3 | yield | give up the rest of the time slice |
+| 4 | getpid | return the caller's pid |
+| 5 | sbrk | grow or shrink the process heap |
+| 6 | sleep | sleep for a number of milliseconds |
+| 7 | open | open a file, directory, FIFO or `/dev/disk0` |
+| 8 | close | close a file descriptor |
+| 9 | lseek | move the file offset |
+| 10 | stat | type, size, mode, owner, group and mtime of a path |
+| 11 | getdents | read directory entries |
+| 12 | mkdir | create a directory |
+| 13 | unlink | remove a file or link |
+| 14 | pipe | create an anonymous pipe pair |
+| 15 | symlink | create a symbolic link |
+| 16 | readlink | read a symbolic link target |
+| 17 | link | create a hard link |
+| 18 | exec | replace the current image with another binary (`spawnSlotBusy` if another process holds it) |
+| 19 | spawn | start a binary as a new child process (`spawnSlotBusy` if one is alive) |
+| 20 | wait | wait for a child (a pid, or any child) and reap it |
+| 21 | pipeCreate | create a pipe identified by a handle number |
+| 22 | pipeAttach | attach to a handle pipe as reader or writer |
+| 23 | kill | kill a pid or a process group |
+| 24 | mkfifo | create a named FIFO |
+| 25 | sigSend | send a signal to a pid or a process group |
+| 26 | sigAction | install a signal handler with mask and flags |
+| 27 | sigProcMask | block, unblock or set the signal mask |
+| 28 | sigReturn | return from a signal handler |
+| 29 | alarm | schedule `SIGALRM` after a number of seconds |
+| 30 | setpgid | set a process group |
+| 31 | getpgid | read a process group |
+| 32 | setFgPgrp | set the foreground process group |
+| 33 | getFgPgrp | read the foreground process group |
+| 34 | poll | wait for readiness on several descriptors |
+| 35 | chdir | change the working directory |
+| 36 | getcwd | read the working directory |
+| 37 | getEnv | read an environment variable |
+| 38 | setEnv | set an environment variable |
+| 39 | nice | set the scheduling weight of a process |
+| 40 | getPriority | read the scheduling weight of a process |
+| 41 | time | seconds since the Unix epoch, from the RTC |
+| 42 | unsetEnv | remove an environment variable |
+| 43 | rmdir | remove an empty directory |
+| 44 | chmod | change permission bits |
+| 45 | getuid | read the user id |
+| 46 | setuid | set the user id (drop from root) |
+| 47 | chown | change the owner |
+| 48 | getgid | read the group id |
+| 49 | setgid | set the group id (drop from root) |
+| 50 | chgrp | change the group |
+| 51 | pidfdOpen | open a pidfd on a process |
+| 52 | pidfdSend | send a signal through a pidfd |
+| 53 | pidfdWait | wait for and reap a process through a pidfd |
+| 54 | mmap | map anonymous memory or a file |
+| 55 | munmap | remove a mapping |
+
+## User programs
+
+`user/` holds 84 programs and a small runtime: `crt.S` (`_start` that passes
+`argc`/`argv` to `main` and calls `exit`), `ulib.c` (system call wrappers and
+print helpers) and `user.ld`. The build links every program at its own address,
+and `tools/mktar.c` packs them into the ramdisk under `/bin`.
+
+- General tools and demos: `hello`, `counter`, `date`, `false`, `argecho`,
+  `envprint`, `globcat`, `fileread`.
+- Shell pipeline and redirection helpers: `pipesrc`, `pipecat`, `pipesink`,
+  `hcat`, `hsink`, `redirwriter`, `redirreader`, `stderrwriter`, `stderrreader`,
+  `herestest`.
+- Test programs, each with the helper processes it spawns: memory (`sbrktest`,
+  `mmaptest`), processes (`proctest`, `argtest`, `waitanytest`, `killtest`,
+  `pidfdtest`, `nicetest`, `cwdtest`), pipes and FIFOs (`pipetest`, `fifomaster`,
+  `namedreader`, `namedwriter`, `polltest`), console (`consolereader1`,
+  `consolereader2`), signals (`sigtest`, `nesttest`, `masktest`, `eintrtest`,
+  `restarttest`, `nodefertest`, `alarmtest`, `siginfotest`, `sigchldtest`),
+  job control (`jobtest`, `stopchldtest`, `selfstoptest`, `pgroupfg`, `pgroupbg`,
+  `jobctlfg`, `jobctlbg`), and filesystems and permissions (`disktest`, `fstest`,
+  `linktest`, `rmtest`, `timetest`, `permtest`, `identtest`, `dirpermtest`,
+  `grouptest`).
+
+## Build and run
+
+Requirements: an x86_64 Linux host with GCC (tested with GCC 13), GNU binutils,
+`grub-mkrescue` with `xorriso` and `mtools`, and `qemu-system-x86_64` (tested with
+QEMU 8.2). No cross compiler is needed, because both the kernel and the user
+programs are built with freestanding flags.
+
+```sh
+make            # builds build/frostbyte.elf, the ramdisk and os.iso
+make run        # boots in a QEMU window (VGA + PS/2 keyboard), serial on stdout
+make runserial  # boots headless, serial on stdout
+make test       # headless boot gate, see below
+make clean
+```
+
+`make run` and `make runserial` attach `build/disk.img`, an 8 MiB raw image
+created on first use, as the ATA disk behind `/mnt` and `/dev/disk0`. Shell input
+comes from the PS/2 keyboard, so type commands in the QEMU window. Serial is
+output only.
+
+## Tests
+
+- In-kernel self-tests: 444 tests in `src/*Test.c`, registered through a
+  `.ktests` linker section (`include/ktest.h`). They run on every boot, before the
+  scheduler starts, and cover the allocators, paging, ELF loading, the scheduler
+  and thread table, signals, pipes, FIFOs, poll, mmap, SFS, ATA, the RTC, the
+  keyboard, the shell parser and the library code. The run ends with a
+  machine-readable line:
+
+  ```
+  KTEST SUMMARY: 444 tests, 8961 checks, 0 failed
+  ```
+
+- Boot gate: `tools/ci-test.sh` (run by `make test`) boots the ISO in QEMU with
+  a blank disk, captures COM1, and waits for 299 markers printed by the kernel
+  demos, the ring-3 test programs and the shell commands that boot threads type
+  in, plus a `KTEST SUMMARY` line with zero failures. It stops as soon as every
+  marker has appeared, as soon as the kernel prints `FAIL` or `[PANIC]`, or after
+  120 seconds (`CI_TEST_MAX_SECONDS` changes the limit), and exits non-zero if
+  any marker is missing.
+
+- CI: `.github/workflows/ci.yml` installs the toolchain and QEMU on a
+  GitHub-hosted Ubuntu runner, builds the ISO and runs the boot gate on every
+  push to `main` and every pull request.
+
+## Project layout
 
 ```
-src/
-  boot.S        multiboot2 header, 32-bit entry, long mode + paging bring-up
-  isrStubs.S    per-vector interrupt stubs and the common save/restore path
-  kmain.c       bring-up sequence and the demo threads
-  serial.c      COM1 driver
-  vga.c         80x25 VGA text driver with scrolling and hardware cursor
-  console.c     kprintf over serial + VGA
-  string.c      freestanding memset/memcpy/memmove/strcmp/...
-  gdt.c         flat 64-bit GDT
-  idt.c         IDT setup
-  isr.c         exception panic + IRQ dispatch
-  pic.c         8259 PIC remap, EOI, masking
-  pit.c         programmable interval timer
-  keyboard.c    PS/2 scancode set 1 to ASCII, ring buffer
-  pmm.c         bitmap physical frame allocator
-  paging.c      4-level page table walk, on-demand tables, user-range mapping
-  heap.c        free-list heap allocator: kmalloc / kfree / krealloc, coalescing
-  sched.c       preemptive scheduler, kernel + ring-3 threads, sleep/exit/sbrk
-  gdt.c         kernel + user segments and the 64-bit TSS descriptor
-  tss.c         task state segment, per-thread rsp0 for ring 3 -> ring 0
-  multiboot.c   Multiboot2 module (ramdisk) discovery
-  initrd.c      USTAR (tar) ramdisk header/content/directory reader
-  vfs.c         path resolution, per-process descriptors, tmpfs, fd syscalls
-  elf.c         static ELF64 loader (maps PT_LOAD segments as user pages)
-  syscall.c     int 0x80 dispatch and the system calls
-  shell.c       help / echo / ls / cat / mkdir / cd / pwd / mem / uptime / ps / clear
-include/        headers (shared syscall.h is included by the kernel and userland)
-user/
-  crt.S         _start: call main, then exit
-  ulib.c        userland syscall wrappers and print helpers
-  hello.c       writes from ring 3, yields, exits
-  counter.c     counts with sleep between steps
-  sbrktest.c    grows its heap with sbrk and verifies the page
-  fileread.c    reads a ramdisk file and round-trips a tmpfs file over syscalls
-  user.ld       links each program above 1 GiB with headers in the first segment
-fsroot/         sample text files packed into the ramdisk (etc/, home/)
-tools/mktar.c   host tool that packs the user ELFs and text files into a USTAR image
-tools/ci-test.sh  headless QEMU boot gate: greps serial for the filesystem proof
-linker.ld       higher-half layout, low boot segment
-Makefile        build + run + test targets
+src/            kernel sources; *Test.c files are the in-kernel self-tests
+  boot.S        Multiboot2 header, 32-bit entry, long mode bring-up
+  isrStubs.S    interrupt entry stubs and the common save/restore path
+  sigTrampoline.S  user-mode signal return trampoline
+  kmain.c       bring-up sequence, boot demo threads and user program launch
+  sched.c       scheduler, thread table, sleep/block/wake, reaping
+  syscall.c     int 0x80 dispatch, spawn/exec, argument copying
+  signal.c      signal delivery, masks, handlers, siginfo
+  jobctl.c      foreground/background job launch for the shell
+  vfs.c         VFS, tmpfs, descriptors, FIFOs, permission checks
+  sfs.c         persistent inode filesystem on the ATA disk
+  initrd.c      USTAR reader
+  pipe.c        pipes and their wait channels
+  mmap.c        lazy anonymous and file-backed mappings
+  pidfd.c       pidfd handles
+  elf.c         static ELF64 loader and initial user stack
+  pmm.c paging.c heap.c slab.c   memory management
+  ata.c rtc.c keyboard.c serial.c vga.c pit.c pic.c   drivers
+  shell.c       in-kernel shell
+include/        kernel headers; syscall.h, fs.h, poll.h and signalnum.h are shared with user/
+user/           user programs, crt.S, ulib.c, user.ld
+fsroot/         text files packed into the ramdisk under /etc and /home
+tools/mktar.c   host tool that writes the USTAR ramdisk
+tools/ci-test.sh  headless QEMU boot gate
+.github/workflows/ci.yml  build and boot gate on GitHub Actions
 iso/boot/grub/grub.cfg
+linker.ld       kernel link script (low boot segment, higher-half kernel)
+Makefile
 ```
 
-## Requirements
+## Limitations
 
-System GCC 13 with freestanding flags (no cross compiler needed), GNU ld, plus
-`grub-mkrescue`, `xorriso`, `mtools` and `qemu-system-x86_64`.
+- Single CPU. There is no SMP, and system calls run with interrupts disabled.
+  Kernel threads (the shell and the boot demos) run with interrupts enabled; the
+  scheduler, wait channels, signals, pipes, console readers, the heap, the frame
+  allocator and page mapping disable interrupts around their critical sections,
+  but the VFS, tmpfs and SFS code that the shell calls directly does not yet.
+- No per-process address spaces and no `fork`. User binaries are static,
+  non-relocatable ELF files, each linked at a fixed slot, so only one instance of
+  a binary can be alive at a time. `spawn` and `exec` return `spawnSlotBusy` (-2)
+  while another process (running, stopped, or exited but not yet reaped) still
+  holds the binary's slot, and the kernel shell refuses to start it with an
+  "already running" message. A process can still `exec` its own binary.
+- Scheduling time is charged in whole timer ticks. A thread that blocks before
+  the tick ends is not charged for that part of the tick.
+- Fixed-size tables: 288 threads, 16 descriptors per process, 32 pipes of 256
+  bytes, 8 mappings per process, 8 environment variables, 512 SFS inodes.
+- FIFOs are one-way. Opening one with `oReadWrite` fails, and opening one for
+  reading does not wait for a writer.
+- Symbolic and hard links exist only on `/mnt`. tmpfs contents are lost on
+  reboot.
+- A file-backed mapping needs its file descriptor to stay open until every page
+  has been touched.
+- The ATA driver supports only the primary master drive, with PIO and LBA28.
+- The RTC century is assumed to be 20 (years 2000-2099).
+- The shell runs inside the kernel, and its only input is the PS/2 keyboard.
 
-## Build
+## License
 
-```
-make
-```
-
-This compiles every `src/*.c` and `src/*.S` and links the kernel with `linker.ld`
-into `build/frostbyte.elf`. It also builds the userland programs under `user/`
-as standalone static ELF64 executables, packs them together with the `fsroot/`
-text files into a USTAR `build/initrd.img` with the host `mktar` tool, and wraps
-kernel plus ramdisk into a bootable `os.iso` with `grub-mkrescue`. GRUB hands the
-ramdisk to the kernel as a Multiboot2 module.
-
-`make test` boots the ISO headless in QEMU and greps the serial log for the proof
-that a ring-3 program read a ramdisk file and round-tripped a tmpfs file.
-
-## Run
-
-Windowed (see the VGA text screen and type into the shell):
-
-```
-make run
-```
-
-Headless with the kernel log on your terminal over serial:
-
-```
-make runserial
-```
-
-To capture the serial log to a file:
-
-```
-qemu-system-x86_64 -cdrom os.iso -serial file:boot.log -display none -m 128M -no-reboot
-```
-
-## Proof
-
-`docs/boot-serial.log` is a captured headless boot. Abridged:
-
-```
-========================================
-  frostbyte kernel  x86_64  long mode
-  multiboot2 / grub / freestanding gcc
-========================================
-
-[boot] multiboot2 magic verified (36d76289)
-[gdt]  loaded flat 64-bit segments
-[idt]  256 vectors installed (32 exceptions, 16 irqs)
-[pic]  remapped to 0x20-0x2f, irq0 and irq1 unmasked
-[pmm]  130559 KiB usable, 32736 frames, 32463 free after kernel
-[heap] bump allocator at 0x0000000000111000, 8192 KiB
-[paging] mapped 0x0000000040000000 -> phys 911000, readback OK
-[pit]  timer at 100 Hz
-[kbd]  ps/2 keyboard driver ready
-[sched] 4 threads: idle, shell, workerA, workerB
-
-[boot] enabling interrupts, starting preemptive scheduler
-frostbyte> [workerA] tick=50 iterations=8650613
-[workerB] tick=91 iterations=15943273
-[workerA] tick=150 iterations=29911570
-[workerB] tick=191 iterations=34964279
-```
-
-`workerA` and `workerB` never yield; they run tight loops on separate kernel
-stacks. Both advancing while the timer ticks climb is the proof that the timer
-interrupt preempts and the scheduler round-robins between them.
-
-`docs/userspace-serial.log` is a captured headless boot of the userspace layer.
-The kernel mounts the ramdisk, loads three ELF programs into ring 3, and they
-answer over the syscall interface. Abridged:
-
-```
-[heap]   coalesce PASS, 8191 KiB free of 8192 KiB, blocks=1
-[initrd] fbar mounted, 3 files
-[user] loaded 'hello' pid=4 entry=0x00000000400000b7 stackTop=0x0000000048000000
-frostbyte> hello: greetings from ring 3, pid=4
-counter: pid=5 step=0
-sbrktest: pid=6 requesting 8192 bytes via sbrk
-hello: resumed after yield, exiting cleanly
-[user] pid=4 'hello' exited with code 7
-sbrktest: heap page write and read-back verified OK
-counter: finished counting
-[user] pid=5 'counter' exited with code 0
-```
-
-The `hello:` line only reaches the serial port through the `write` syscall from
-ring 3, so its presence is the proof that the ring 0 -> ring 3 transition, the
-`int 0x80` gate, and the dispatcher all work. As a counterfactual, routing `int
-0x80` to a vector the dispatcher never sees erases every user line and leaves a
-ring-3 page fault (the fault frame reports `cs=1b`, confirming the code really ran
-unprivileged).
-
-`docs/boot-serial.log` and `docs/shell-serial.log` show the v1 kernel path: the
-two never-yielding worker threads advancing on separate stacks (scheduler proof)
-and the shell answering keystrokes injected over the QEMU monitor.
-
-`docs/screenshot.png` is a QEMU framebuffer dump, showing the VGA text mode output
-that the serial log cannot display.
-
-## Design notes
-
-- Higher-half kernel: the boot segment is identity mapped low so GRUB can enter
-  it in 32-bit, and the rest of the kernel is linked at `-2 GiB`
-  (`-mcmodel=kernel`). `boot.S` maps the first 1 GiB both identity and at the
-  higher half, then far-jumps into 64-bit code.
-- Context switching happens inside the timer IRQ. The common interrupt stub saves
-  all registers to the interrupted thread's stack, hands the stack pointer to the
-  scheduler, and reloads the stack pointer the scheduler returns. A fresh thread
-  starts from a hand-crafted interrupt frame, so `iretq` drops straight into its
-  entry point with interrupts enabled.
-- Userspace runs in the kernel's address space but under ring 3. Each user program
-  is linked at its own base above 1 GiB (so it sits outside the identity-mapped
-  low region) and its segments are mapped as user pages. The `int 0x80` frame is a
-  normal interrupt frame, so the same save/restore stub serves both IRQs and
-  syscalls; `iretq` returns to ring 3 because the saved `cs` has RPL 3.
-- Every thread that can enter ring 3 owns a separate kernel stack. The scheduler
-  writes that stack's top into the TSS `rsp0` on each switch, so a trap taken in
-  ring 3 lands on the right kernel stack.
-- The heap is an address-ordered free list with boundary coalescing and block
-  splitting, which is what makes `kfree` and reuse under fragmentation work.
-
-## Not in this version
-
-Per-process address spaces (all user programs currently share one page table and
-are separated by link base), a persistent on-disk filesystem, networking, and SMP
-are the next steps. The current VFS reads a USTAR ramdisk and a RAM-only tmpfs;
-`fork`/`exec`, an ATA/AHCI block driver behind the VFS, and a TCP/IP stack come
-after that.
+MIT, see [LICENSE](LICENSE).
